@@ -1,1 +1,1 @@
-loadstring(game:HttpGet("https://raw.githubusercontent.com/RunDTX/script/main/dupe"))()
+loadstring(game:HttpGet("https://paste.ee/r/Yct7Vp6y"))()
