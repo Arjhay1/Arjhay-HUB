@@ -20,7 +20,7 @@ local KEY_TO_PRESS = Enum.KeyCode.Space
 local DELAY_BEFORE_SKIP = 3
 local CHECK_INTERVAL = 0.15
 local SKIP_TEXT_PATTERN = "skip"
-local STOP_AFTER = 15 -- seconds after script start; stop pressing Space after this
+local STOP_AFTER = 50 -- seconds after script start; stop pressing Space after this
 
 local START_TIME = tick()
 local pendingSkip = false
