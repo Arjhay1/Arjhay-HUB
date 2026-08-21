@@ -2571,9 +2571,463 @@ Bin.onUnload(function() autoShells = false end)
 --==============================================================
 -- COMBAT TAB   (placeholder)
 --==============================================================
+-- Sits above Performance on purpose -- the tab order was asked for as Config, Farm,
+-- Combat, Performance, and addTab() takes its LayoutOrder from #tabs, so creation
+-- order IS sidebar order. Moving a tab means moving its addTab() call, nothing else.
 comingSoon(addTab("Combat"),
 	"Kill aura and gun mods are not built yet. This tab is a placeholder. Murderer"
 	.. " tracking lives in the ESP tab.")
+
+--==============================================================
+-- PERFORMANCE TAB   (FPS Boost)
+--==============================================================
+-- Asked for as "FPS Boost this like it will destroy building, walls etc of course
+-- should all function working". Both halves of that are requirements, and the second
+-- one decides the whole design.
+--
+-- WHAT IT WILL NOT DO, AND WHY
+-- It does not delete anything you can stand on. A part with CanCollide = true is made
+-- INVISIBLE, never destroyed. Deleting a floor drops you through the map, which in
+-- MM2 kills you for the round -- and dying is a bigger performance problem than any
+-- number of frames. It is also how you earn a position kick. So the split is:
+--   * CanCollide = false  ->  DESTROYED. Nothing stands on it, nothing collides with
+--     it, nothing can be reached through it. This is the foliage, the signs, the
+--     clutter, the decorative meshes -- pure render cost, zero gameplay. This is the
+--     "destroy" that was asked for, and it is the half where destroying is free.
+--   * CanCollide = true   ->  Transparency 1 + CastShadow off. The wall is gone from
+--     the screen and gone from the render pass, but the collision box is untouched,
+--     so the map still plays exactly as it did. You cannot fall out of it, you cannot
+--     walk through a wall you should not, and the murderer's line of sight is
+--     unchanged.
+-- Deleting collidable walls would ALSO be a gameplay change, not just a visual one,
+-- which "all function working" rules out on its own.
+--
+-- WHY THE DESTROY IS LESS PERMANENT THAN IT SOUNDS
+-- MM2 builds a fresh map every round. Anything destroyed here is back next round,
+-- and the sweep simply runs again on the new map. So the irreversible half undoes
+-- itself on a timer measured in minutes, which is what makes destroying acceptable
+-- at all. Turning a switch off restores the hidden half immediately from a snapshot.
+--
+-- PROTECTED BY STRUCTURE, NOT BY A LIST OF NAMES
+-- Coins, characters, tools and pickups are skipped entirely. Note that protection
+-- matching here is deliberately LOOSE (substrings, not whole words) -- the exact
+-- opposite call from Auto Pick Device above. There, over-matching presses the wrong
+-- button and costs a rejoin, so it must be strict. Here, over-matching keeps a prop
+-- alive and costs a frame, while under-matching deletes a coin the collector needs.
+-- Same file, opposite rule, because the cost of being wrong points the other way.
+--
+-- IT MUST NOT COST WHAT IT SAVES
+-- A synchronous walk of a full MM2 Workspace, mutating every part, is a multi-second
+-- freeze on the phone this is meant to help. So the sweep is PACED: a fixed budget of
+-- instances per frame, yielding in between. Protection answers are memoised per
+-- ancestor, because otherwise every part re-climbs and re-lowercases the same six
+-- parents. And the restore walk materialises its keys into a strong array first --
+-- never iterate a weak table across a yield, or a collection mid-walk throws
+-- "invalid key to 'next'".
+--==============================================================
+;(function()
+	local Perf = addTab("Performance")
+
+	-- declared in here, not at the top of the file: the main chunk is at its local
+	-- register ceiling and a function body is its own frame (see the ESP note below)
+	local Lighting = game:GetService("Lighting")
+	local WS       = workspace
+
+	-- ON is the truth. Every switch writes exactly one field of it and asks for a
+	-- pass; nothing else holds state about what is stripped.
+	local ON = { geo = false, light = false, tex = false, fx = false, water = false }
+
+	local BUDGET  = 250        -- instances touched per frame during a sweep
+	local RESWEEP = 6          -- seconds between catch-up passes while anything is on
+
+	local alive           = true
+	local working, again  = false, false
+	local touched         = false      -- have we modified anything that needs undoing
+	local fpsCap          = 0
+
+	-- weak keys throughout: MM2 destroys the whole map every round, and a strong
+	-- reference to last round's 8000 parts is a leak that grows for as long as the
+	-- session lasts
+	local snap    = setmetatable({}, { __mode = "k" })   -- part     -> original fields
+	local fxSnap  = setmetatable({}, { __mode = "k" })   -- effect   -> original Enabled
+	local decSnap = setmetatable({}, { __mode = "k" })   -- decal    -> original Transparency
+	local protCache = setmetatable({}, { __mode = "k" }) -- instance -> protected?
+
+	----------------------------------------------------------------
+	-- what must never be touched
+	----------------------------------------------------------------
+	-- Two independent routes to the same protection, on purpose: a rename in the game
+	-- can only ever break one of them. This is the same reasoning as currentNames()
+	-- over in Farm, and for the same reason -- these are the instances Auto Collect
+	-- Coins and the ESP tab read, so losing one silently breaks a different feature.
+	local KEEP_SUB = {
+		"coin", "gun", "knife", "revolver", "pistol", "weapon",
+		"drop", "spawn", "chest", "crate", "door", "ladder", "elevator",
+	}
+	local function nameKept(n)
+		local low = string.lower(n)
+		for _, w in ipairs(KEEP_SUB) do
+			if string.find(low, w, 1, true) then return true end
+		end
+		-- route two: the game's own word for "things that matter" is a Container
+		-- folder. Live coins are Coin_Server inside CoinContainer.
+		return #low >= 9 and string.sub(low, -9) == "container"
+	end
+
+	-- Memoised and recursive: each ancestor is answered once and every part below it
+	-- reuses that answer. Without this, a 9000 part map re-climbs and re-lowercases
+	-- the same handful of parent names 9000 times per sweep.
+	local function keptAncestor(node)
+		if node == nil or node == WS then return false end
+		local hit = protCache[node]
+		if hit ~= nil then return hit end
+		local v
+		if node:IsA("Tool") or node:IsA("Accessory") then
+			v = true                        -- held or equipped: never scenery
+		elseif node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+			v = true                        -- a character. Player ESP reads these.
+		elseif nameKept(node.Name) then
+			v = true
+		else
+			v = keptAncestor(node.Parent)
+		end
+		protCache[node] = v
+		return v
+	end
+
+	local function kept(p)
+		-- Terrain and spawns are load-bearing in the most literal sense
+		if p:IsA("Terrain") or p:IsA("SpawnLocation") then return true end
+		return keptAncestor(p)
+	end
+
+	----------------------------------------------------------------
+	-- one part
+	----------------------------------------------------------------
+	local function take(p)
+		local s = snap[p]
+		if s then return s end
+		s = { t = p.Transparency, m = p.Material, c = p.CastShadow, r = p.Reflectance }
+		if p:IsA("MeshPart") then s.f = p.RenderFidelity end
+		snap[p]  = s
+		touched  = true
+		return s
+	end
+
+	-- Writes the value each field SHOULD have for the switches as they stand right
+	-- now. That is the whole trick: there is no separate "undo" path to keep in step
+	-- with the apply path, so a switch going off restores exactly the fields it owns
+	-- and leaves the others alone. Idempotent, and no visible flash when a second
+	-- switch is added to a strip that is already running.
+	local function reconcile(p, s)
+		p.Transparency = ON.geo and 1 or s.t
+		p.CastShadow   = ON.geo and false or s.c
+		p.Material     = ON.tex and Enum.Material.SmoothPlastic or s.m
+		p.Reflectance  = ON.tex and 0 or s.r
+		if s.f ~= nil then
+			p.RenderFidelity = ON.tex and Enum.RenderFidelity.Performance or s.f
+		end
+	end
+
+	local function visitPart(p)
+		if kept(p) then return end
+		local s = snap[p]
+		if ON.geo and not p.CanCollide then
+			-- the safe half of "destroy buildings and walls": decoration only
+			p:Destroy()
+			return
+		end
+		if s == nil then
+			-- never touched and nothing wants it touched: do not even snapshot it,
+			-- or turning everything off would record the entire map for no reason
+			if not (ON.geo or ON.tex) then return end
+			s = take(p)
+		end
+		reconcile(p, s)
+	end
+
+	local FX = {
+		ParticleEmitter = true, Trail = true, Beam = true, Smoke = true,
+		Fire = true, Sparkles = true,
+		PointLight = true, SpotLight = true, SurfaceLight = true,
+	}
+
+	local function visitOther(d)
+		local cls = d.ClassName
+		if FX[cls] then
+			if fxSnap[d] == nil then
+				if not ON.fx then return end
+				fxSnap[d] = d.Enabled
+				touched   = true
+			end
+			d.Enabled = not ON.fx and fxSnap[d] or false
+		elseif cls == "Decal" or cls == "Texture" then
+			if decSnap[d] == nil then
+				if not ON.tex then return end
+				decSnap[d] = d.Transparency
+				touched    = true
+			end
+			d.Transparency = ON.tex and 1 or decSnap[d]
+		end
+	end
+
+	----------------------------------------------------------------
+	-- lighting and water: small, fixed, and instant
+	----------------------------------------------------------------
+	local lightSnap, waterSnap = nil, nil
+
+	local function doLighting()
+		if ON.light and not lightSnap then
+			lightSnap = {
+				gs  = Lighting.GlobalShadows,
+				br  = Lighting.Brightness,
+				fe  = Lighting.FogEnd,
+				ed  = Lighting.EnvironmentDiffuseScale,
+				es  = Lighting.EnvironmentSpecularScale,
+				tech = Lighting.Technology,
+				post = {},
+				atmo = {},
+			}
+			for _, e in ipairs(Lighting:GetDescendants()) do
+				if e:IsA("PostEffect") then
+					lightSnap.post[e] = e.Enabled
+				elseif e:IsA("Atmosphere") then
+					lightSnap.atmo[e] = { d = e.Density, h = e.Haze, g = e.Glare }
+				end
+			end
+		end
+		if not lightSnap then return end
+		local s = lightSnap
+		Lighting.GlobalShadows            = not ON.light and s.gs or false
+		Lighting.Brightness               = ON.light and 2 or s.br
+		Lighting.FogEnd                   = ON.light and 1e6 or s.fe
+		Lighting.EnvironmentDiffuseScale  = ON.light and 0 or s.ed
+		Lighting.EnvironmentSpecularScale = ON.light and 0 or s.es
+		-- Technology is the single biggest lever on a phone (Future and ShadowMap both
+		-- do per-pixel lighting work that Voxel does not) and it is also the one most
+		-- likely to be locked at runtime, hence the pcall rather than a guess.
+		pcall(function()
+			Lighting.Technology = ON.light and Enum.Technology.Compatibility or s.tech
+		end)
+		for e, was in pairs(s.post) do
+			if e.Parent then e.Enabled = not ON.light and was or false end
+		end
+		for e, was in pairs(s.atmo) do
+			if e.Parent then
+				e.Density = ON.light and 0 or was.d
+				e.Haze    = ON.light and 0 or was.h
+				e.Glare   = ON.light and 0 or was.g
+			end
+		end
+		if ON.light then touched = true end
+	end
+
+	local function doWater()
+		local t = WS.Terrain
+		if not t then return end
+		if ON.water and not waterSnap then
+			waterSnap = {
+				ws = t.WaterWaveSize, sp = t.WaterWaveSpeed,
+				rf = t.WaterReflectance, tr = t.WaterTransparency,
+			}
+		end
+		if not waterSnap then return end
+		local s = waterSnap
+		t.WaterWaveSize    = ON.water and 0 or s.ws
+		t.WaterWaveSpeed   = ON.water and 0 or s.sp
+		t.WaterReflectance = ON.water and 0 or s.rf
+		t.WaterTransparency = ON.water and 0 or s.tr
+		if ON.water then touched = true end
+	end
+
+	----------------------------------------------------------------
+	-- the paced sweep
+	----------------------------------------------------------------
+	local function anyOn()
+		return ON.geo or ON.light or ON.tex or ON.fx or ON.water
+	end
+
+	local function sweep(ignoreAlive)
+		local list = WS:GetDescendants()
+		local n = 0
+		for i = 1, #list do
+			if not (alive or ignoreAlive) then return end
+			local d = list[i]
+			-- A stale entry from this snapshot is a harmless wasted write, not a chase:
+			-- unlike the coin pool's ghost bug, nothing here moves the character toward
+			-- the instance, so `.Parent ~= nil` is a good enough cheap filter and does
+			-- not need to be a real liveness test.
+			if d.Parent ~= nil then
+				if d:IsA("BasePart") then
+					pcall(visitPart, d)
+				else
+					pcall(visitOther, d)
+				end
+			end
+			n = n + 1
+			if n >= BUDGET then
+				n = 0
+				RunService.Heartbeat:Wait()
+			end
+		end
+	end
+
+	-- Restoring walks what we TOUCHED, not the Workspace: after a round change most of
+	-- the snapshot is dead and most of the Workspace was never ours. The keys are
+	-- copied into a strong array in one non-yielding pass FIRST -- iterating a weak
+	-- table across a yield lets the collector take a key mid-walk, which throws
+	-- "invalid key to 'next'". That bug cost a whole afternoon in the other hub.
+	local function restoreTouched(ignoreAlive)
+		local parts, fx, dec = {}, {}, {}
+		for p in pairs(snap)    do parts[#parts + 1] = p end
+		for e in pairs(fxSnap)  do fx[#fx + 1]       = e end
+		for d in pairs(decSnap) do dec[#dec + 1]     = d end
+
+		local n = 0
+		local function tick()
+			n = n + 1
+			if n >= BUDGET then n = 0; RunService.Heartbeat:Wait() end
+		end
+		for _, p in ipairs(parts) do
+			if not (alive or ignoreAlive) then return end
+			if p.Parent then pcall(reconcile, p, snap[p]) end
+			tick()
+		end
+		for _, e in ipairs(fx) do
+			if e.Parent then pcall(function() e.Enabled = fxSnap[e] end) end
+			tick()
+		end
+		for _, d in ipairs(dec) do
+			if d.Parent then pcall(function() d.Transparency = decSnap[d] end) end
+			tick()
+		end
+	end
+
+	local function run()
+		doLighting()
+		doWater()
+		if anyOn() then
+			sweep(false)
+		elseif touched then
+			restoreTouched(false)
+			-- swapped for fresh tables rather than cleared: table.clear on a weak table
+			-- that the collector is working through is the other way to earn "invalid
+			-- key to 'next'". Dropping the reference lets the whole thing go at once.
+			snap    = setmetatable({}, { __mode = "k" })
+			fxSnap  = setmetatable({}, { __mode = "k" })
+			decSnap = setmetatable({}, { __mode = "k" })
+			lightSnap, waterSnap = nil, nil
+			touched = false
+		end
+	end
+
+	-- Coalescing gate. The one toggle sets all five flags in a single statement and
+	-- asks for one pass, so this no longer has to absorb a burst from the UI -- but it
+	-- still does for the two drivers below: a round change and the catch-up timer can
+	-- both land while a sweep is mid-yield, and `again` turns that into one more pass
+	-- instead of two sweeps fighting over the same 9000 parts.
+	local function schedule()
+		if working then again = true; return end
+		working = true
+		task.spawn(function()
+			repeat
+				again = false
+				local ok, err = pcall(run)
+				if not ok then warn("[Arjhay Hub] perf: " .. tostring(err)) end
+			until not again or not alive
+			working = false
+		end)
+	end
+
+	----------------------------------------------------------------
+	-- ui
+	----------------------------------------------------------------
+	-- ONE switch, by request: "delete the What Gets Stripped just combine it to FPS
+	-- Boost toggle". The five scopes still exist in the engine above -- they are how
+	-- reconcile() knows which fields it owns, and dropping them would mean five
+	-- hard-coded apply paths and five hard-coded undo paths -- but they are no longer
+	-- five rows the user has to reason about.
+	--
+	-- Setting all five in ONE statement is strictly better than the five `api:Set(v)`
+	-- calls this replaced, not just fewer rows: those arrived as five separate
+	-- task.spawn callbacks, so the first sweep could start against a half-set ON table
+	-- and only the `again` pass saw the truth. A single assignment cannot be observed
+	-- half-done, so the first pass is already the correct one.
+	local boostSec = Perf:Section("FPS Boost")
+	boostSec.card.LayoutOrder = 1
+
+	-- Only two Cfg keys are left here, of different kinds, so the alphabetical
+	-- same-rank tiebreak no longer decides anything. A config saved by the previous
+	-- build still carries five `perf.scope.*` keys: Cfg.apply walks Cfg.rows and looks
+	-- values up by key, so a saved key with no row is simply never read. Nothing to
+	-- migrate, and nothing that will fight this toggle on load.
+	Cfg.add("perf.boost", "toggle",
+	boostSec:Toggle("FPS Boost", false, function(v)
+		ON.geo, ON.light, ON.tex, ON.fx, ON.water = v, v, v, v, v
+		schedule()
+	end))
+
+	boostSec:Label("Walls and buildings stop being drawn and their decoration is"
+		.. " deleted, lighting goes flat, textures and particles stop. Collision is"
+		.. " never touched, so you cannot fall through a floor that stopped being"
+		.. " drawn -- and coins, players and held weapons are skipped, so the rest of"
+		.. " the hub keeps working.")
+
+	local rateSec = Perf:Section("Frame Rate")
+	rateSec.card.LayoutOrder = 2
+
+	Cfg.add("perf.fpscap", "slider",
+	rateSec:Slider("FPS Cap (0 = unlimited)", 0, 360, 0, function(v)
+		fpsCap = math.floor(v)
+		-- 0 is asked for as "unlimited", but a literal setfpscap(0) means different
+		-- things in different executors and in some of them it means "stop drawing",
+		-- so unlimited is sent as a number no device will reach instead of as 0.
+		if type(setfpscap) == "function" then
+			pcall(setfpscap, fpsCap > 0 and fpsCap or 9999)
+		end
+	end))
+
+	rateSec:Label("Only does anything if your executor supports it -- if yours does"
+		.. " not, this slider is ignored and nothing breaks. Capping LOWER is worth"
+		.. " trying on a phone that throttles when it gets hot: a steady 45 beats 60"
+		.. " that collapses to 20.")
+
+	----------------------------------------------------------------
+	-- drivers
+	----------------------------------------------------------------
+	-- A new round means a whole new map, and it arrives as one ChildAdded on Workspace
+	-- followed by the map filling itself in over the next second or two. So this is a
+	-- nudge, not the mechanism -- the catch-up pass below is what actually finishes
+	-- the job on a map that was still loading when the first sweep ran.
+	Bin.conn(WS.ChildAdded:Connect(function()
+		if anyOn() then schedule() end
+	end))
+
+	task.spawn(function()
+		while alive do
+			task.wait(RESWEEP)
+			if alive and anyOn() then schedule() end
+		end
+	end)
+
+	-- while-loops cannot be reached by Bin.flush(), so the flag they spin on has to be
+	-- cleared by hand -- the same bug class as the shells loop and the device picker.
+	-- The restore is spawned rather than run inline because Bin.flush() is what makes
+	-- the close button feel instant: a synchronous walk of 9000 parts inside an
+	-- onUnload handler is a visible freeze at exactly the moment the user asked for
+	-- the hub to go away. It ignores `alive` on purpose, since it is the thing that
+	-- has to outlive it, and it is a finite job that ends on its own.
+	Bin.onUnload(function()
+		alive = false
+		if not touched then return end
+		for k in pairs(ON) do ON[k] = false end
+		task.spawn(function()
+			pcall(doLighting)
+			pcall(doWater)
+			pcall(restoreTouched, true)
+		end)
+	end)
+end)()
 
 --==============================================================
 -- ESP TAB
@@ -3350,17 +3804,36 @@ end)()
 --     writes a report. Ambiguity is a dump, never a coin flip.
 --   * handlers are tried before coordinates, because firing a button's own signal
 --     cannot physically land on its neighbour.
---   * the inset variants only ever move the click VERTICALLY (36px), and the two
---     panels sit side by side, so even a wrong inset guess cannot press Tablet.
---     That is the only reason coordinate fallbacks are allowed here at all.
+--
+-- ONE SHOT. THIS IS THE RULE THE FIRST BUILD GOT WRONG.
+-- v1 pressed the panel four ways in a burst (handlers, click, click+inset,
+-- click-raw), judged the result, and if the popup was still there it did the whole
+-- burst again three seconds later, for three minutes. It froze the user's phone.
+-- The mechanism was a feedback loop, not just repetition:
+--   1. picking a device REBUILDS the menu -- that is what "will mess up your menu"
+--      means -- so the panel we pressed is destroyed and replaced.
+--   2. the cooldown was keyed on that panel INSTANCE, so the rebuilt panel was a
+--      brand new key with no cooldown at all.
+--   3. so a press that WORKED read as a press that missed, and earned an immediate
+--      retry, whose rebuild earned another. ~240 presses and 240 menu rebuilds.
+-- The debounce was invalidated by the very thing it was debouncing. So now:
+--   * ONE input event, ever. A latch is set the instant anything is sent and this
+--     block never scans or presses again for the rest of the session.
+--   * no coordinate variants. insetApplies() already computes the right answer from
+--     IgnoreGuiInset; trying the other one "just in case" is what a storm is made of.
+--   * the ONLY thing that can send a second event is fireHandlers returning false,
+--     which does not mean "it missed" -- it means the signal had no connections and
+--     literally nothing was sent. That is bounded at two events for the session.
+--   * verification still runs, but it now decides only what gets REPORTED. It can no
+--     longer decide to press again. Being wrong quietly once beats being wrong 240
+--     times, and if it did miss, the dump says so and a manual tap costs one tap.
 --
 -- COST
--- Polling PlayerGui forever for a popup that only shows at join would be rude, so
--- this is ARMED rather than permanent: fast for 45s, slow until a 3 minute deadline,
--- then the loop simply ends and costs nothing. A new ScreenGui arriving in PlayerGui
--- re-arms it, which is the only cheap signal that a new popup might exist. The
--- expensive checks all sit behind a keyword prefilter, so a normal tick is one
--- GetDescendants walk and a string.find per text node.
+-- Armed, not permanent: fast for 30s, slow until a 2 minute deadline, then the loop
+-- ends and costs nothing. A new ScreenGui in PlayerGui re-arms it. A tick walks only
+-- the ENABLED ScreenGuis and skips our own hub -- v1 walked all of PlayerGui every
+-- 0.4s including the several hundred instances of this very interface, which on a
+-- phone is a stutter all by itself, before a single click is sent.
 --==============================================================
 ;(function()
 	local WANT   = "phone"
@@ -3387,15 +3860,24 @@ end)()
 	}
 
 	local HOPS       = 8            -- ancestors walked up from a phone label
-	local FAST, SLOW = 0.4, 1.5
-	local FAST_FOR   = 45           -- seconds of fast polling per arming
-	local LIFETIME   = 180          -- seconds before the loop gives up entirely
+	-- The chooser is a MODAL: it sits there waiting for you, so there is nothing to
+	-- react quickly to. A 1s tick is imperceptible to a human and two and a half times
+	-- cheaper than v1's 0.4s, which is the whole reason those numbers were wrong.
+	local FAST, SLOW = 1.0, 3.0
+	local FAST_FOR   = 30           -- seconds of fast polling per arming
+	local LIFETIME   = 120          -- seconds before the loop gives up entirely
+	local SETTLE     = 0.35         -- time given to the popup to react before judging
 	local DUMP_PATH  = "ArjhayHub_MM2_device.txt"
 
+	-- `fired` is a LATCH, not a "did it work" flag. It goes true the moment any input
+	-- is sent and nothing clears it -- no scan, no press, no re-arm afterwards for the
+	-- rest of the session. There is deliberately no `tried` table any more: v1 keyed a
+	-- 3s cooldown on the panel instance, and picking a device destroys and rebuilds
+	-- that instance, so the new one was never in the table and the "cooldown" let
+	-- every single tick press again. See the ONE SHOT note above.
 	local wantLoop, busy = true, false
-	local picked, dumped = false, false
+	local fired, dumped = false, false
 	local armUntil, deadline, lastWarn = 0, 0, 0
-	local tried = setmetatable({}, { __mode = "k" })   -- panel -> os.clock() pressed
 
 	local function isTextNode(d)
 		return d:IsA("TextLabel") or d:IsA("TextButton")
@@ -3431,6 +3913,23 @@ end)()
 		return nil
 	end
 
+	-- The surfaces worth walking: an ENABLED LayerCollector that is not our own. A
+	-- disabled one cannot be showing a popup whatever is inside it, and MM2 parks most
+	-- of its menus as disabled ScreenGuis, so this skips most of PlayerGui for free.
+	-- Excluding `screen` earns its place twice: the hub is several hundred instances of
+	-- pure cost on a tick that used to run every 0.4s, and it is text WE wrote, so it
+	-- has no business being evidence about what the game is showing.
+	local function surfaces(pg)
+		local out = {}
+		for _, sg in ipairs(pg:GetChildren()) do
+			if sg ~= screen and sg:IsA("LayerCollector") then
+				local ok, on = pcall(function() return sg.Enabled end)
+				if ok and on then table.insert(out, sg) end
+			end
+		end
+		return out
+	end
+
 	----------------------------------------------------------------
 	-- the report, for when the guesswork does not pan out
 	----------------------------------------------------------------
@@ -3444,24 +3943,64 @@ end)()
 			warn("[Arjhay Hub] device: " .. why .. " -- no writefile, cannot report")
 			return
 		end
+
+		-- The report deliberately does NOT reuse surfaces() as a filter. This file only
+		-- ever gets written because the scanner did the wrong thing, and if the reason
+		-- was that surfaces() wrongly skipped the chooser's own ScreenGui, a report
+		-- built through the same filter would show an empty screen and hide the bug
+		-- that caused it. So: walk everything except our own hub, and MARK which nodes
+		-- the scanner was able to see. A row tagged [scanner skipped] next to the word
+		-- Phone is the answer on its own.
+		local scannable = {}
+		for _, sg in ipairs(surfaces(pg)) do scannable[sg] = true end
+		local function surfaceOf(d)
+			local cur = d
+			while cur and cur ~= pg do
+				if cur:IsA("LayerCollector") then return cur end
+				cur = cur.Parent
+			end
+			return nil
+		end
+		local function tag(d)
+			local sg = surfaceOf(d)
+			if sg and scannable[sg] then return "" end
+			return "   [scanner skipped: " .. (sg and (sg.Name .. " is disabled") or "no surface") .. "]"
+		end
+
+		local roots = {}
+		for _, sg in ipairs(pg:GetChildren()) do
+			if sg ~= screen and sg:IsA("LayerCollector") then table.insert(roots, sg) end
+		end
+
 		local out = {}
 		table.insert(out, "Arjhay Hub -- Choose Your Device report")
 		table.insert(out, "why: " .. why)
 		table.insert(out, "looking for the whole word: " .. WANT)
+		table.insert(out, "one shot only: the latch is up, nothing here will press again")
+		table.insert(out, "")
+		table.insert(out, "== surfaces in PlayerGui (our own hub excluded) ==")
+		for _, sg in ipairs(roots) do
+			table.insert(out, string.format("  %-28s %s", sg.Name,
+				scannable[sg] and "ENABLED (scanned)" or "disabled (skipped)"))
+		end
+		if #roots == 0 then table.insert(out, "  (none at all)") end
 		table.insert(out, "")
 		table.insert(out, "== visible text on screen ==")
 		local n = 0
-		for _, d in ipairs(pg:GetDescendants()) do
-			if isTextNode(d) and #d.Text > 0 and n < 150 then
-				local ok, vis = pcall(trulyVisible, d)
-				if ok and vis then
-					n = n + 1
-					table.insert(out, string.format(
-						"%3d  %-12s %-22s pos=%d,%d  size=%dx%d  text=%s",
-						n, d.ClassName, d.Name,
-						math.floor(d.AbsolutePosition.X), math.floor(d.AbsolutePosition.Y),
-						math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y), d.Text))
-					table.insert(out, "     " .. d:GetFullName())
+		for _, sg in ipairs(roots) do
+			for _, d in ipairs(sg:GetDescendants()) do
+				if isTextNode(d) and #d.Text > 0 and n < 150 then
+					local ok, vis = pcall(trulyVisible, d)
+					if ok and vis then
+						n = n + 1
+						table.insert(out, string.format(
+							"%3d  %-12s %-22s pos=%d,%d  size=%dx%d  text=%s%s",
+							n, d.ClassName, d.Name,
+							math.floor(d.AbsolutePosition.X), math.floor(d.AbsolutePosition.Y),
+							math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y),
+							d.Text, tag(d)))
+						table.insert(out, "     " .. d:GetFullName())
+					end
 				end
 			end
 		end
@@ -3469,16 +4008,18 @@ end)()
 		table.insert(out, "")
 		table.insert(out, "== visible buttons ==")
 		local b = 0
-		for _, d in ipairs(pg:GetDescendants()) do
-			if d:IsA("GuiButton") and b < 80 then
-				local ok, vis = pcall(trulyVisible, d)
-				if ok and vis then
-					b = b + 1
-					table.insert(out, string.format("%3d  %-12s %-22s pos=%d,%d  size=%dx%d",
-						b, d.ClassName, d.Name,
-						math.floor(d.AbsolutePosition.X), math.floor(d.AbsolutePosition.Y),
-						math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y)))
-					table.insert(out, "     " .. d:GetFullName())
+		for _, sg in ipairs(roots) do
+			for _, d in ipairs(sg:GetDescendants()) do
+				if d:IsA("GuiButton") and b < 80 then
+					local ok, vis = pcall(trulyVisible, d)
+					if ok and vis then
+						b = b + 1
+						table.insert(out, string.format("%3d  %-12s %-22s pos=%d,%d  size=%dx%d%s",
+							b, d.ClassName, d.Name,
+							math.floor(d.AbsolutePosition.X), math.floor(d.AbsolutePosition.Y),
+							math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y), tag(d)))
+						table.insert(out, "     " .. d:GetFullName())
+					end
 				end
 			end
 		end
@@ -3499,26 +4040,28 @@ end)()
 		local pg = LocalPlayer:FindFirstChild("PlayerGui")
 		if not pg then return "no playergui" end
 
-		-- ONE walk. trulyVisible is expensive per node (it climbs to the root), so it
-		-- only ever runs on a node whose text already matched a keyword.
+		-- ONE walk per enabled surface. trulyVisible is expensive per node (it climbs to
+		-- the root), so it only ever runs on a node whose text already matched a keyword.
 		local phones, titled = {}, false
-		for _, d in ipairs(pg:GetDescendants()) do
-			if isTextNode(d) then
-				local raw = d.Text
-				if #raw > 0 and #raw <= 200 then
-					local low = string.lower(raw)
-					if not titled then
-						for _, bit in ipairs(TITLE_BITS) do
-							if string.find(low, bit, 1, true) and trulyVisible(d) then
-								titled = true
-								break
+		for _, sg in ipairs(surfaces(pg)) do
+			for _, d in ipairs(sg:GetDescendants()) do
+				if isTextNode(d) then
+					local raw = d.Text
+					if #raw > 0 and #raw <= 200 then
+						local low = string.lower(raw)
+						if not titled then
+							for _, bit in ipairs(TITLE_BITS) do
+								if string.find(low, bit, 1, true) and trulyVisible(d) then
+									titled = true
+									break
+								end
 							end
 						end
-					end
-					if string.find(low, WANT, 1, true) then
-						local w = {}
-						for x in string.gmatch(low, "%a+") do w[x] = true end
-						if w[WANT] and trulyVisible(d) then table.insert(phones, d) end
+						if string.find(low, WANT, 1, true) then
+							local w = {}
+							for x in string.gmatch(low, "%a+") do w[x] = true end
+							if w[WANT] and trulyVisible(d) then table.insert(phones, d) end
+						end
 					end
 				end
 			end
@@ -3554,8 +4097,10 @@ end)()
 				end
 				target = target or chain[#chain]
 
-				local tw = subtreeWords(target, 400)
-				if tw[WANT] and not anyWord(tw, RIVALS) and not anyWord(tw, DENY) then
+				-- named tws, not tw: `tw` is the file's tween helper, and shadowing it
+				-- inside a 150-line function is a trap laid for whoever edits next
+				local tws = subtreeWords(target, 400)
+				if tws[WANT] and not anyWord(tws, RIVALS) and not anyWord(tws, DENY) then
 					if best == nil then
 						best, bestWrap = target, wrap
 					elseif best ~= target then
@@ -3580,12 +4125,11 @@ end)()
 			return "no chooser context"
 		end
 
-		local stamp = tried[best]
-		if stamp and (os.clock() - stamp) < 3 then return "cooling down" end
-		tried[best] = os.clock()
-
-		-- A press counts only when the popup actually goes away. pcall not throwing
-		-- proves nothing -- that lesson came from the shells clicker.
+		-- A press counts only when the popup actually goes away -- pcall not throwing
+		-- proves nothing, that lesson came from the shells clicker. But note what this
+		-- is now FOR: it decides what gets logged, and it is read AFTER the latch is
+		-- already set. It cannot ask for another press. In v1 it could, and a rebuilt
+		-- menu made it ask ~240 times.
 		local wrap = bestWrap or best
 		local function gone()
 			if best.Parent == nil or wrap.Parent == nil then return true end
@@ -3596,24 +4140,42 @@ end)()
 		end
 		if gone() then return "already gone" end
 
-		local ways = {}
-		if best:IsA("GuiButton") then
-			table.insert(ways, { "handlers", function() return fireHandlers(best) end })
-		end
-		table.insert(ways, { "click", function() return sendClick(best, insetApplies(best)) end })
-		table.insert(ways, { "click+inset", function() return sendClick(best, true) end })
-		table.insert(ways, { "click-raw", function() return sendClick(best, false) end })
+		-- THE LATCH GOES UP BEFORE THE PRESS, NOT AFTER.
+		-- Setting it afterwards would leave a window where the press has landed, the
+		-- game is already rebuilding the menu, and this function has not yet recorded
+		-- that anything happened -- and if the press throws, or the scheduler steps
+		-- away at the task.wait below, that window is where a second press comes from.
+		-- The whole bug was a press that did not count as one.
+		fired = true
 
-		for _, way in ipairs(ways) do
-			way[2]()
-			task.wait(0.15)                 -- let the popup react before judging
-			if gone() then
-				print("[Arjhay Hub] device: chose Phone via " .. way[1] .. ".")
-				return "picked"
-			end
+		local how = nil
+		if best:IsA("GuiButton") and fireHandlers(best) then
+			-- Firing the panel's own connections cannot physically land on Tablet, so
+			-- this is the safest possible way in and it is tried first.
+			how = "handlers"
+		else
+			-- Either it is not a button, or the signal had no connections and so
+			-- literally nothing was sent -- which is not a miss, it is a no-op, and is
+			-- the ONE case allowed to send a second event. insetApplies reads
+			-- IgnoreGuiInset off the panel's own LayerCollector, so it is the answer,
+			-- not a guess; v1's extra "try it the other way" variants are gone.
+			sendClick(best, insetApplies(best))
+			how = "click"
 		end
-		dumpDevice(pg, "found the Phone panel but nothing closed the popup")
-		return "all methods missed"
+
+		task.wait(SETTLE)
+		if gone() then
+			print("[Arjhay Hub] device: chose Phone via " .. how .. ". Stopping.")
+			return "picked"
+		end
+		-- Pressed once and the popup is still up. It may have worked anyway (a chooser
+		-- that stays open until the menu reloads looks identical to one that ignored
+		-- us), so this reports and stops rather than escalating. One manual tap is a
+		-- cheaper failure than a click storm.
+		dumpDevice(pg, "pressed the Phone panel via " .. how
+			.. " and it was still on screen " .. SETTLE .. "s later -- stopped anyway,"
+			.. " one shot only. Tap Phone by hand if it did not take.")
+		return "pressed, unconfirmed"
 	end
 
 	----------------------------------------------------------------
@@ -3622,35 +4184,55 @@ end)()
 	local function loop()
 		if busy then return end
 		busy = true
-		while wantLoop and not picked and os.clock() < deadline do
+		-- `fired` is checked here AND at the top of arm(), because these are two
+		-- different ways back in: this one ends the tick loop, that one refuses to
+		-- start a new one when a ScreenGui shows up later.
+		while wantLoop and not fired and os.clock() < deadline do
 			local ok, res = pcall(scan)
 			if not ok then
-				if os.clock() - lastWarn > 5 then      -- never spam at 0.4s
+				if os.clock() - lastWarn > 5 then      -- never spam at tick rate
 					lastWarn = os.clock()
 					warn("[Arjhay Hub] device: " .. tostring(res))
 				end
-			elseif res == "picked" then
-				picked = true
 			end
+			-- Note what is NOT here any more: v1 set its stop flag from `res == "picked"`,
+			-- i.e. only when the popup was confirmed gone. Any other outcome kept the
+			-- loop alive to press again. scan() now latches itself the instant it sends
+			-- anything, so every outcome ends this loop, confirmed or not.
+			if fired then break end
 			task.wait((os.clock() < armUntil) and FAST or SLOW)
 		end
 		busy = false
 	end
 
 	local function arm()
+		if fired then return end
 		armUntil = os.clock() + FAST_FOR
 		deadline = os.clock() + LIFETIME
-		if not busy and not picked then task.spawn(loop) end
+		if not busy then task.spawn(loop) end
 	end
 
 	-- The popup may also be up before the hub is injected, in which case the first
 	-- tick already catches it. This connection is for the other case: a chooser that
 	-- arrives later inside a ScreenGui of its own. It cannot see a popup that lives
 	-- in an ALREADY existing ScreenGui and merely gets re-enabled, which is why the
-	-- first arming polls for three minutes rather than trusting events.
+	-- first arming polls rather than trusting events.
+	--
+	-- THIS WAS THE THIRD AMPLIFIER, and the one that made v1's "2 minute deadline"
+	-- meaningless. Choosing a device rebuilds the menu, a rebuilt menu parents new
+	-- ScreenGuis into PlayerGui, ChildAdded fires, and arm() pushed `deadline` out by
+	-- another full LIFETIME and `armUntil` back to fast. So every press bought the
+	-- loop more time to press again -- the lifetime cap could never expire while the
+	-- storm was running, because the storm itself kept renewing it. arm() now refuses
+	-- outright once the latch is up, and this hands itself in as soon as it sees that.
 	local pgNow = LocalPlayer:FindFirstChild("PlayerGui")
 	if pgNow then
-		Bin.conn(pgNow.ChildAdded:Connect(function(child)
+		local armConn
+		armConn = Bin.conn(pgNow.ChildAdded:Connect(function(child)
+			if fired then
+				if armConn then pcall(function() armConn:Disconnect() end) end
+				return
+			end
 			if child:IsA("LayerCollector") then arm() end
 		end))
 	end
