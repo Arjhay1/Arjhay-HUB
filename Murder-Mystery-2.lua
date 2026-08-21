@@ -1380,6 +1380,7 @@ end
 Bin.onUnload(function()
 	Cfg.rows = {}
 	Cfg.setStatus = nil
+	Cfg.startMin = nil
 end)
 
 function Cfg.clean(s)
@@ -1538,6 +1539,30 @@ end
 function Cfg.autoSet(name)
 	if not Cfg.canWrite then return false end
 	return pcall(writefile, Cfg.autoPath, (name and name ~= "") and name or "")
+end
+
+-- Reads ONE value out of the autoload config WITHOUT applying anything.
+--
+-- Cfg.load cannot serve this. Loading means calling :Set on controls, so it has to
+-- run dead last, after every tab is built -- and "should the window open minimized"
+-- has to be answered before the window opens at all. Peeking is what makes a
+-- start-up preference possible without opening the window and folding it again a
+-- fifth of a second later.
+--
+-- Same untrusted-file rules as Cfg.load: every step is pcall'd, and it returns the
+-- raw value so the caller decides what a valid one looks like. nil means "no
+-- autoload set", "unreadable", "not json", or "that key was never saved" -- all four
+-- are the same answer to the caller, which is "use the default".
+function Cfg.autoPeek(key)
+	local name = Cfg.autoGet()
+	if not name then return nil end
+	local ok, body = pcall(readfile, Cfg.path(name))
+	if not ok or type(body) ~= "string" then return nil end
+	local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+	if not ok2 or type(data) ~= "table" then return nil end
+	local vals = data.values or data
+	if type(vals) ~= "table" then return nil end
+	return vals[key]
 end
 
 --==============================================================
@@ -1709,6 +1734,25 @@ do
 		if a then nameBox:Set(a) end
 	end
 	rebuild()
+
+	----------------------------------------------------------------
+	-- Window
+	----------------------------------------------------------------
+	local win = Config:Section("Window")
+	win.card.LayoutOrder = 3
+
+	-- This toggle stores a preference and nothing else -- flipping it now must NOT
+	-- minimize the window, because "start minimized" is a statement about the next
+	-- load, and folding the hub the instant you tick the box reads like a bug. The
+	-- thing that acts on it is the open step at the bottom of the file, which peeks
+	-- the saved value through Cfg.autoPeek before anything is drawn.
+	Cfg.add("window.startmin", "toggle",
+	win:Toggle("Start Minimized", false, function(v) Cfg.startMin = v end))
+
+	win:Label("Opens the hub as just the circle on the next load. Tap the circle to"
+		.. " open the window, or press Right Shift. It is saved inside the config like"
+		.. " every other setting, so it only takes effect for a config that Auto Load"
+		.. " is switched on for -- tick this, save, then switch Auto Load on above.")
 end
 
 --==============================================================
@@ -3627,9 +3671,25 @@ end)()
 selectTab(Farm)
 applySearch("")
 
-root.Size = UDim2.fromOffset(WIN_W, WIN_H - 24)
-root.BackgroundTransparency = 1
-tw(root, 0.22, { Size = UDim2.fromOffset(WIN_W, WIN_H), BackgroundTransparency = 0 })
+-- Start Minimized is PEEKED out of the autoload config here rather than waited for.
+-- The real autoload runs dead last -- it has to, every control must exist before
+-- anything is :Set -- and by the time it fires the window has already tweened open,
+-- so a preference read from it could only ever fold a window the user had already
+-- seen. setMinimized(true) is deliberately not used either: it plays a 0.14s shrink
+-- and then swaps to the circle, which is exactly the flash this setting exists to
+-- avoid. Open straight as the circle instead, leaving root at full size and fully
+-- opaque so the first restore behaves like every other one.
+if Cfg.autoPeek("window.startmin") == true then
+	minimized    = true
+	root.Visible = false
+	pip.Visible  = true
+	pip.Size     = UDim2.fromOffset(30, 30)
+	tw(pip, 0.16, { Size = UDim2.fromOffset(52, 52) })
+else
+	root.Size = UDim2.fromOffset(WIN_W, WIN_H - 24)
+	root.BackgroundTransparency = 1
+	tw(root, 0.22, { Size = UDim2.fromOffset(WIN_W, WIN_H), BackgroundTransparency = 0 })
+end
 
 --==============================================================
 -- auto load
