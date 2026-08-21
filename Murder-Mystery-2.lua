@@ -13,6 +13,7 @@ local RunService       = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local GuiService       = game:GetService("GuiService")
 local CoreGui          = game:GetService("CoreGui")
+local HttpService      = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -514,6 +515,9 @@ local function addTab(name)
 		Parent = sidebar, AutoButtonColor = false, Text = "",
 		Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Panel,
 		BackgroundTransparency = 1, BorderSizePixel = 0,
+		-- explicit, because the sidebar sorts by LayoutOrder and every button
+		-- defaulting to 0 leaves the running order down to child insertion
+		LayoutOrder = #tabs,
 	})
 	corner(button, 8)
 	local bar = new("Frame", {
@@ -632,6 +636,103 @@ local function addTab(name)
 
 	if not activeTab then selectTab(tab) end
 	return tab
+end
+
+--==============================================================
+-- "coming soon" page
+--==============================================================
+-- Three of the four tabs have no features yet, and an empty scrolling frame reads
+-- as a broken tab rather than as a planned one. This fills the page with a card
+-- that says so deliberately. The clock is drawn out of Frames for the usual
+-- reason: a glyph the device's font happens to lack renders as an empty box.
+local function comingSoon(tab, blurb)
+	local card = new("Frame", {
+		Parent = tab.page, Active = true, BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 240), BackgroundColor3 = T.Card,
+	})
+	corner(card, 10)
+	stroke(card)
+	local edge = card:FindFirstChildOfClass("UIStroke")
+
+	-- the dial is an empty Frame wearing a circular UIStroke: a ring, no glyph
+	local dial = new("Frame", {
+		Parent = card, BackgroundTransparency = 1, BorderSizePixel = 0,
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 40),
+		Size = UDim2.fromOffset(44, 44),
+	}, {
+		new("UICorner", { CornerRadius = UDim.new(1, 0) }),
+		new("UIStroke", { Color = T.Accent, Thickness = 2 }),
+	})
+	local ring = dial:FindFirstChildOfClass("UIStroke")
+
+	local handA = new("Frame", {                    -- hour hand, straight up
+		Parent = dial, BorderSizePixel = 0, BackgroundColor3 = T.Accent,
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.fromOffset(2, 12),
+	}, { new("UICorner", { CornerRadius = UDim.new(0, 1) }) })
+	local handB = new("Frame", {                    -- minute hand, out to the right
+		Parent = dial, BorderSizePixel = 0, BackgroundColor3 = T.Accent,
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.fromOffset(11, 2),
+	}, { new("UICorner", { CornerRadius = UDim.new(0, 1) }) })
+
+	local title = new("TextLabel", {
+		Parent = card, BackgroundTransparency = 1, Font = FONT_B,
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 98),
+		Size = UDim2.new(1, -40, 0, 20),
+		Text = "COMING SOON", TextSize = 15, TextColor3 = T.Text,
+	})
+	local rule = new("Frame", {
+		Parent = card, BorderSizePixel = 0, BackgroundColor3 = T.Accent,
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 126),
+		Size = UDim2.fromOffset(28, 2),
+	})
+	corner(rule, 1)
+	local sub = new("TextLabel", {
+		Parent = card, BackgroundTransparency = 1, Font = FONT,
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 140),
+		Size = UDim2.new(1, -72, 0, 40),
+		Text = blurb, TextSize = 12, TextColor3 = T.Sub, TextWrapped = true,
+	})
+
+	local pill = new("Frame", {
+		Parent = card, Active = true, BorderSizePixel = 0,
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 192),
+		Size = UDim2.fromOffset(136, 24), BackgroundColor3 = T.AccentDim,
+	})
+	corner(pill, 12)
+	local pillText = new("TextLabel", {
+		Parent = pill, BackgroundTransparency = 1, Font = FONT_M,
+		Size = UDim2.fromScale(1, 1), Text = "IN DEVELOPMENT",
+		TextSize = 11, TextColor3 = T.Text,
+	})
+
+	-- everything else in this hub animates, so the placeholder fades in each time
+	-- its tab is opened. It fades rather than slides because the page's
+	-- UIListLayout owns the card's Position and would fight a move tween.
+	local solids = { handA, handB, rule, pill }
+	local texts  = { title, sub, pillText }
+
+	local function fadeIn()
+		card.BackgroundTransparency = 1
+		if edge then edge.Transparency = 1 end
+		if ring then ring.Transparency = 1 end
+		for _, f in ipairs(solids) do f.BackgroundTransparency = 1 end
+		for _, l in ipairs(texts)  do l.TextTransparency = 1 end
+
+		tw(card, PULSE, { BackgroundTransparency = 0 })
+		if edge then tw(edge, PULSE, { Transparency = 0 }) end
+		if ring then tw(ring, PULSE, { Transparency = 0 }) end
+		for _, f in ipairs(solids) do tw(f, PULSE, { BackgroundTransparency = 0 }) end
+		for _, l in ipairs(texts)  do tw(l, PULSE, { TextTransparency = 0 }) end
+	end
+
+	Bin.conn(tab.page:GetPropertyChangedSignal("Visible"):Connect(function()
+		if tab.page.Visible then fadeIn() end
+	end))
+	fadeIn()
+
+	return card
 end
 
 --==============================================================
@@ -1222,6 +1323,390 @@ local function myRoot()
 end
 
 --==============================================================
+-- config engine
+--==============================================================
+-- Every control already exposes the same two methods, :Get and :Set, so a config
+-- is just a map of key -> value. The keys below are written out by hand rather than
+-- derived from each control's label: a label is a thing that gets reworded (this
+-- hub has already renamed a tab and two rows), and a reworded label must not
+-- silently orphan every config the user has saved.
+--
+-- Everything lives on one table on purpose. This file is close to Luau's ceiling
+-- of 200 top-level locals, and past it the error is reported as a nil call on
+-- line 1, which is a miserable thing to debug.
+local Cfg = {
+	rows   = {},                          -- ordered { key, kind, api }
+	dir    = "ArjhayHub/MM2/configs",
+	flat   = "ArjhayHub_MM2_cfg_",
+	useDir = false,
+	-- APPLY ORDER, and it matters: a toggle starts a loop that reads the sliders,
+	-- so every number and list has to be in place before any switch is thrown.
+	rank   = { input = 1, slider = 2, dropdown = 3, toggle = 4 },
+}
+
+Cfg.canWrite = (type(writefile) == "function") and (type(readfile) == "function")
+
+do
+	if Cfg.canWrite and type(makefolder) == "function" and type(isfolder) == "function" then
+		pcall(function()
+			for _, p in ipairs({ "ArjhayHub", "ArjhayHub/MM2", Cfg.dir }) do
+				if not isfolder(p) then makefolder(p) end
+			end
+		end)
+		local ok, is = pcall(isfolder, Cfg.dir)
+		Cfg.useDir = ok and is == true
+	end
+end
+
+-- .txt, so it can never be mistaken for a config by the .json listing below
+Cfg.autoPath = Cfg.useDir and (Cfg.dir .. "/autoload.txt")
+	or (Cfg.flat .. "autoload.txt")
+
+function Cfg.add(key, kind, api)
+	table.insert(Cfg.rows, { key = key, kind = kind, api = api })
+	return api
+end
+
+-- Cfg.rows holds a closure per control, and every one of those closures captures
+-- the Instances that make up its row. Cfg is also handed out through
+-- getgenv().ArjhayHub, which survives the close button -- so without this, closing
+-- the hub would leave a table in the global environment pinning the whole
+-- destroyed interface in memory.
+Bin.onUnload(function()
+	Cfg.rows = {}
+	Cfg.setStatus = nil
+end)
+
+function Cfg.clean(s)
+	s = tostring(s or "")
+	s = s:gsub("^%s+", ""):gsub("%s+$", "")
+	s = s:gsub("[^%w _%-]", "")             -- a name becomes a filename; keep it tame
+	return string.sub(s, 1, 24)
+end
+
+function Cfg.path(name)
+	if Cfg.useDir then return Cfg.dir .. "/" .. name .. ".json" end
+	return Cfg.flat .. name .. ".json"
+end
+
+function Cfg.capture()
+	local out = {}
+	for _, e in ipairs(Cfg.rows) do
+		local ok, v = pcall(function()
+			if e.kind == "dropdown" then return e.api:List() end
+			return e.api:Get()
+		end)
+		if ok then out[e.key] = v end
+	end
+	return out
+end
+
+-- A saved config is just a file: it can be hand-edited, half-written, or left over
+-- from an older build. Every value is checked against the control it belongs to, so
+-- one bad entry is skipped instead of throwing inside a :Set and leaving the whole
+-- UI half restored.
+local function cfgTypeOk(kind, v)
+	if kind == "toggle"   then return type(v) == "boolean" end
+	if kind == "slider"   then return type(v) == "number" and v == v end
+	if kind == "dropdown" then return type(v) == "table" end
+	if kind == "input"    then return type(v) == "string" end
+	return false
+end
+
+-- JSONDecode hands back whatever the file said, so a dropdown's list is rebuilt
+-- from scratch here: strings only, array part only, and capped. A junk entry is
+-- inert against a real option list, but without this it would be saved straight
+-- back out again on the next Save and live in the file forever.
+local function cfgList(v)
+	local out = {}
+	for _, s in ipairs(v) do
+		if type(s) == "string" and #s > 0 and #s < 64 then
+			out[#out + 1] = s
+			if #out >= 64 then break end
+		end
+	end
+	return out
+end
+
+function Cfg.apply(values)
+	if type(values) ~= "table" then return 0, 0 end
+	local order = {}
+	for _, e in ipairs(Cfg.rows) do order[#order + 1] = e end
+	table.sort(order, function(a, b)
+		local ra, rb = Cfg.rank[a.kind] or 9, Cfg.rank[b.kind] or 9
+		if ra ~= rb then return ra < rb end
+		return a.key < b.key
+	end)
+
+	local done, skipped = 0, 0
+	for _, e in ipairs(order) do
+		local v = values[e.key]
+		if v == nil then
+			-- absent is not an error: a config saved before a feature existed just
+			-- leaves that control at whatever it already was
+		elseif not cfgTypeOk(e.kind, v) then
+			skipped = skipped + 1
+		else
+			if e.kind == "dropdown" then v = cfgList(v) end
+			if pcall(function() e.api:Set(v) end) then
+				done = done + 1
+			else
+				skipped = skipped + 1
+			end
+		end
+	end
+	return done, skipped
+end
+
+function Cfg.names()
+	local out = {}
+	if not Cfg.canWrite or type(listfiles) ~= "function" then return out end
+	local ok, files = pcall(listfiles, Cfg.useDir and Cfg.dir or ".")
+	if not ok or type(files) ~= "table" then return out end
+	for _, f in ipairs(files) do
+		local base = tostring(f):gsub("\\", "/"):match("([^/]+)$")
+		if base then
+			local name
+			if Cfg.useDir then
+				name = base:match("^(.+)%.json$")
+			else
+				name = base:match("^" .. Cfg.flat .. "(.+)%.json$")
+			end
+			if name and #name > 0 then out[#out + 1] = name end
+		end
+	end
+	table.sort(out, function(a, b) return string.lower(a) < string.lower(b) end)
+	return out
+end
+
+function Cfg.save(name)
+	if not Cfg.canWrite then return false, "this executor cannot write files" end
+	local ok, body = pcall(function()
+		return HttpService:JSONEncode({
+			hub    = "ArjhayHub MM2",
+			name   = name,
+			saved  = os.date("%Y-%m-%d %H:%M:%S"),
+			values = Cfg.capture(),
+		})
+	end)
+	if not ok then return false, "could not encode" end
+	if pcall(writefile, Cfg.path(name), body) then return true end
+	return false, "could not write the file"
+end
+
+function Cfg.load(name)
+	if not Cfg.canWrite then return nil, "this executor cannot read files" end
+	local p = Cfg.path(name)
+	if type(isfile) == "function" then
+		local okf, is = pcall(isfile, p)
+		if okf and not is then return nil, "no config named " .. tostring(name) end
+	end
+	local ok, body = pcall(readfile, p)
+	if not ok or type(body) ~= "string" then return nil, "could not read it" end
+	local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+	if not ok2 or type(data) ~= "table" then return nil, "that file is not valid json" end
+	local done, skipped = Cfg.apply(data.values or data)
+	return done, skipped
+end
+
+function Cfg.remove(name)
+	if type(delfile) ~= "function" then return false, "this executor cannot delete files" end
+	if pcall(delfile, Cfg.path(name)) then return true end
+	return false, "could not delete it"
+end
+
+function Cfg.autoGet()
+	if not Cfg.canWrite then return nil end
+	if type(isfile) == "function" then
+		local okf, is = pcall(isfile, Cfg.autoPath)
+		if okf and not is then return nil end
+	end
+	local ok, body = pcall(readfile, Cfg.autoPath)
+	if not ok or type(body) ~= "string" then return nil end
+	local name = Cfg.clean(body)
+	if name == "" then return nil end
+	return name
+end
+
+-- Clearing writes an empty file rather than deleting one, because delfile is not
+-- on every executor and an empty file reads back as "no autoload" anyway.
+function Cfg.autoSet(name)
+	if not Cfg.canWrite then return false end
+	return pcall(writefile, Cfg.autoPath, (name and name ~= "") and name or "")
+end
+
+--==============================================================
+-- CONFIG TAB
+--==============================================================
+local Config = addTab("Config")
+
+-- Created before Farm so the sidebar reads Config, Farm, Combat, ESP top to
+-- bottom. Farm is still the tab the hub OPENS on, because it is the one that does
+-- something -- see selectTab(Farm) at the bottom of the file.
+do
+	local sec = Config:Section("Config Manager")
+	sec.card.LayoutOrder = 1        -- explicit: two cards tied at 0 sort by whatever
+	                                -- GetChildren happens to return, same trap as the
+	                                -- sidebar buttons had
+
+	sec:Label("Saves every toggle, slider and dropdown in the hub. Stored as "
+		.. ((Cfg.useDir and (Cfg.dir .. "/") or Cfg.flat) .. "NAME.json")
+		.. (Cfg.canWrite and "" or "  --  UNAVAILABLE: this executor cannot write files."))
+
+	local status  = sec:Label("Ready.")
+	local nameBox = sec:Input("Config Name", "my config")
+	-- forward declared: rebuild() below has to be able to switch this off when the
+	-- config it points at is deleted, and a closure only captures a local that is
+	-- already in scope where the closure is written
+	local autoTog
+
+	Cfg.setStatus = function(s) pcall(function() status:Set(s) end) end
+
+	local listSec  = Config:Section("Saved Configs")
+	listSec.card.LayoutOrder = 2
+	local rowConns = {}
+	local rowKids  = {}
+
+	-- Registered with the search index, unlike the rows below: a section with no
+	-- searchable row of its own gets hidden the moment anything is typed into the
+	-- search box, because applySearch only lights a card that one of its rows matched.
+	listSec:Label("Load puts every saved setting back. Delete removes the file.")
+
+	-- The rows are rebuilt on every save and delete, so their connections cannot go
+	-- into Bin: that list would grow by two per row per refresh and never shrink.
+	-- They get their own list, dropped before each rebuild and once more on unload.
+	local function dropRowConns()
+		for _, c in ipairs(rowConns) do pcall(function() c:Disconnect() end) end
+		rowConns = {}
+	end
+	Bin.onUnload(dropRowConns)
+
+	local rebuild
+	rebuild = function()
+		dropRowConns()
+		-- destroys exactly what a previous rebuild made, never "every child that is
+		-- not a UIListLayout": the static label above is a child too, and destroying
+		-- it would leave searchRows holding a dead Instance forever
+		for _, k in ipairs(rowKids) do pcall(function() k:Destroy() end) end
+		rowKids = {}
+
+		local names = Cfg.names()
+		if #names == 0 then
+			rowKids[1] = new("TextLabel", {
+				Parent = listSec.body, BackgroundTransparency = 1, Font = FONT,
+				Size = UDim2.new(1, 0, 0, 22), TextSize = 12, TextColor3 = T.Sub,
+				LayoutOrder = 1, TextXAlignment = Enum.TextXAlignment.Left,
+				Text = Cfg.canWrite and "Nothing saved yet."
+					or "File access unavailable on this executor.",
+			})
+			return
+		end
+
+		local auto = Cfg.autoGet()
+		for i, name in ipairs(names) do
+			local row = new("Frame", {
+				Parent = listSec.body, Active = true, BackgroundColor3 = T.Bg,
+				BorderSizePixel = 0, LayoutOrder = i, Size = UDim2.new(1, 0, 0, 32),
+			})
+			rowKids[#rowKids + 1] = row
+			corner(row, 8)
+			stroke(row)
+			pad(row, 0, 0, 10, 6)
+			new("TextLabel", {
+				Parent = row, BackgroundTransparency = 1, Font = FONT,
+				Size = UDim2.new(1, -112, 1, 0), TextSize = 12,
+				TextColor3 = (name == auto) and T.Accent or T.Text,
+				Text = (name == auto) and (name .. "   (auto)") or name,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+			})
+
+			local function chip(label, x, w, col)
+				local b = new("TextButton", {
+					Parent = row, AutoButtonColor = false, BorderSizePixel = 0,
+					AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, x, 0.5, 0),
+					Size = UDim2.fromOffset(w, 22), BackgroundColor3 = col,
+					Font = FONT_M, Text = label, TextSize = 11, TextColor3 = T.Text,
+				})
+				corner(b, 6)
+				return b
+			end
+			local del  = chip("Delete", 0, 50, T.Hover)
+			local load = chip("Load", -54, 42, T.AccentDim)
+
+			table.insert(rowConns, load.MouseButton1Click:Connect(function()
+				pulse(load)
+				nameBox:Set(name)
+				local done, extra = Cfg.load(name)
+				if done then
+					status:Set("Loaded " .. name .. ": " .. done .. " settings restored"
+						.. ((extra > 0) and (", " .. extra .. " skipped") or "") .. ".")
+				else
+					status:Set("Load failed: " .. tostring(extra))
+				end
+			end))
+			table.insert(rowConns, del.MouseButton1Click:Connect(function()
+				pulse(del)
+				local ok, why = Cfg.remove(name)
+				status:Set(ok and ("Deleted " .. name .. ".")
+					or ("Delete failed: " .. tostring(why)))
+				if ok and Cfg.autoGet() == name then
+					Cfg.autoSet(nil)
+					if autoTog then autoTog:Set(false, true) end
+				end
+				rebuild()
+			end))
+		end
+	end
+
+	sec:Button("Save Config", function()
+		local name = Cfg.clean(nameBox:Get())
+		if name == "" then
+			status:Set("Type a name first. Letters, numbers, spaces, - and _ only.")
+			return
+		end
+		local ok, why = Cfg.save(name)
+		if not ok then
+			status:Set("Save failed: " .. tostring(why))
+			return
+		end
+		nameBox:Set(name)
+		if autoTog and autoTog:Get() then Cfg.autoSet(name) end
+		status:Set("Saved " .. name .. " (" .. #Cfg.rows .. " settings).")
+		rebuild()
+	end)
+
+	sec:Button("Refresh List", function()
+		rebuild()
+		status:Set("Found " .. #Cfg.names() .. " saved.")
+	end)
+
+	autoTog = sec:Toggle("Auto Load On Launch", Cfg.autoGet() ~= nil, function(on)
+		if not on then
+			Cfg.autoSet(nil)
+			status:Set("Auto load off.")
+			rebuild()
+			return
+		end
+		local name = Cfg.clean(nameBox:Get())
+		if name == "" then
+			status:Set("Put a config name in the box first, then switch this on.")
+			autoTog:Set(false, true)      -- silent, or this callback re-enters itself
+			return
+		end
+		Cfg.autoSet(name)
+		status:Set("Auto load set to " .. name .. ".")
+		rebuild()
+	end)
+
+	do
+		local a = Cfg.autoGet()
+		if a then nameBox:Set(a) end
+	end
+	rebuild()
+end
+
+--==============================================================
 -- FARM TAB   (renamed from "Main" by request)
 --==============================================================
 local Farm = addTab("Farm")
@@ -1730,19 +2215,26 @@ end)
 --------------------------------------------------------------------
 -- controls, in the order asked for: target → speed → delay → toggle
 --------------------------------------------------------------------
+-- Cfg.add returns the control it was handed, so registering one is a wrap around
+-- the call that was already here. The keys are fixed strings and must stay fixed:
+-- rename one and every config the user has already saved forgets that setting.
+Cfg.add("farm.coins.target", "dropdown",
 coinSec:Dropdown("Target", CAT_LABELS, { "Coins" }, function(set)
 	coinCats, namesDirty = set, true
 	containerStamp, poolStamp = -1e9, -1e9    -- force a fresh Workspace walk
-end)
+end))
 
 -- 0 is a real setting on this one, not a floor: at 0 the character stops flying
 -- and only takes coins that come to it (see glideToward)
-coinSec:Slider("Tween Speed (studs/s)", 0, 100, 60, function(v) coinSpeed = v end)
+Cfg.add("farm.coins.speed", "slider",
+coinSec:Slider("Tween Speed (studs/s)", 0, 100, 60, function(v) coinSpeed = v end))
 -- the length of the deliberate stop at each coin. It starts at 1 by request, so
 -- there is no longer a "never stop" setting here.
-coinSec:Slider("Delay Between Pickups", 1, 2, 1, function(v) coinDelay = v end)
+Cfg.add("farm.coins.delay", "slider",
+coinSec:Slider("Delay Between Pickups", 1, 2, 1, function(v) coinDelay = v end))
 
-coinSec:Toggle("Auto Collect Coins", false, function(on) setCollecting(on) end)
+Cfg.add("farm.coins.enabled", "toggle",
+coinSec:Toggle("Auto Collect Coins", false, function(on) setCollecting(on) end))
 
 -- Deleted by request: "Return To Start When Empty", the status label, and the
 -- "Extra Names" textbox. Pickup names come from the ReplicatedStorage.Coins
@@ -2012,11 +2504,13 @@ local function shellLoop()
 	shellBusy = false
 end
 
+Cfg.add("farm.shells.enabled", "toggle",
 shellSec:Toggle("Auto Claim Shells", false, function(on)
 	autoShells = on
 	if on then task.spawn(shellLoop) end
-end)
-shellSec:Slider("Check Every (sec)", 0.1, 2, 0.4, function(v) shellDelay = v end)
+end))
+Cfg.add("farm.shells.delay", "slider",
+shellSec:Slider("Check Every (sec)", 0.1, 2, 0.4, function(v) shellDelay = v end))
 
 -- "Claim Once Now" and the status label were deleted by request. The toggle now
 -- does everything the manual button did.
@@ -2024,6 +2518,18 @@ shellSec:Slider("Check Every (sec)", 0.1, 2, 0.4, function(v) shellDelay = v end
 -- the loop is a while-loop, not a connection, so Bin.flush() cannot reach it:
 -- clear the flag it spins on or it keeps polling forever after the close button
 Bin.onUnload(function() autoShells = false end)
+
+--==============================================================
+-- COMBAT TAB   (placeholder)
+--==============================================================
+comingSoon(addTab("Combat"),
+	"Kill aura, gun mods and murderer tracking are not built yet. This tab is a placeholder.")
+
+--==============================================================
+-- ESP TAB   (placeholder)
+--==============================================================
+comingSoon(addTab("ESP"),
+	"Player, role, coin and gun highlights are not built yet. This tab is a placeholder.")
 
 --==============================================================
 -- open
@@ -2035,6 +2541,29 @@ root.Size = UDim2.fromOffset(WIN_W, WIN_H - 24)
 root.BackgroundTransparency = 1
 tw(root, 0.22, { Size = UDim2.fromOffset(WIN_W, WIN_H), BackgroundTransparency = 0 })
 
+--==============================================================
+-- auto load
+--==============================================================
+-- Dead last on purpose. Loading a config means calling :Set on controls, so every
+-- one of them has to exist first -- run this any higher up and it silently restores
+-- only the half of the hub that had been built by then.
+do
+	local name = Cfg.autoGet()
+	if name then
+		task.spawn(function()
+			local done, extra = Cfg.load(name)
+			if done then
+				local msg = "Auto loaded " .. name .. ": " .. done .. " settings"
+					.. ((extra > 0) and (", " .. extra .. " skipped") or "") .. "."
+				if Cfg.setStatus then Cfg.setStatus(msg) end
+				print("[Arjhay Hub] " .. msg)
+			elseif Cfg.setStatus then
+				Cfg.setStatus("Auto load failed: " .. tostring(extra))
+			end
+		end)
+	end
+end
+
 if getgenv then
 	getgenv().ArjhayHub = {
 		Screen    = screen,
@@ -2045,6 +2574,7 @@ if getgenv then
 		Unload    = unload,
 		Minimize  = setMinimized,
 		Theme     = T,
+		Config    = Cfg,
 	}
 end
 
