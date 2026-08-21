@@ -195,7 +195,12 @@ local function wipeOld(container)
 	if not container then return end
 	pcall(function()
 		for _, old in ipairs(container:GetChildren()) do
-			if old.Name == "ArjhayHub" then pcall(function() old:Destroy() end) end
+			-- "ArjhayHubESP" too: the ESP draws into a Folder of its own, next to this
+			-- ScreenGui rather than inside it, so a run that died without unloading
+			-- would otherwise leave highlights and name tags on screen forever.
+			if old.Name == "ArjhayHub" or old.Name == "ArjhayHubESP" then
+				pcall(function() old:Destroy() end)
+			end
 		end
 	end)
 end
@@ -2523,13 +2528,1098 @@ Bin.onUnload(function() autoShells = false end)
 -- COMBAT TAB   (placeholder)
 --==============================================================
 comingSoon(addTab("Combat"),
-	"Kill aura, gun mods and murderer tracking are not built yet. This tab is a placeholder.")
+	"Kill aura and gun mods are not built yet. This tab is a placeholder. Murderer"
+	.. " tracking lives in the ESP tab.")
 
 --==============================================================
--- ESP TAB   (placeholder)
+-- ESP TAB
 --==============================================================
-comingSoon(addTab("ESP"),
-	"Player, role, coin and gun highlights are not built yet. This tab is a placeholder.")
+-- WHERE THE ROLE COMES FROM
+--
+-- The 240 second role dump, run through one whole round, settled this. Four things
+-- that look like they have to carry a role, and do not:
+--   · attributes    — EquippedKnife / EquippedGun are the COSMETIC loadout. Every
+--                     player carries both, all round, alive or dead: smiddy09091995
+--                     read EquippedKnife=Boneblade while holding nothing at all.
+--   · Value objects — DisplayRefKnife and DisplayRefGun sit on EVERY character,
+--                     eight of them across four players, so they separate nobody.
+--   · Teams         — "Teams service holds: no teams at all".
+--   · leaderstats   — no fields on anyone.
+-- The server->client remotes that DO name a role only ever talk about ME:
+-- RoleSelect("Sheriff", nil, nil, false, "Classic") and GiveWeapon("Gun"). Nothing
+-- this client is sent says who anybody else is.
+--
+-- That leaves the TOOL, and two findings sitting inside the dump's own player table
+-- turn it from a last resort into a real signal:
+--   1. Player.Backpack REPLICATES in this game. The dump went in expecting the
+--      opposite -- its own note reads "Backpack normally does NOT replicate" -- and
+--      then printed  smiddy09091995 backpack: visible: Toys,Knife  while that
+--      player's hands were empty and tool= was "-". So the murderer is knowable the
+--      moment the round STARTS, not the moment they first swing.
+--   2. The Tool NAME is the role, never the skin. That same knife Tool is called
+--      "Knife" whether the attribute says Boneblade, HeartWand or nothing.
+--
+-- Sheriff vs Hero falls out of ORDER rather than out of any field: whoever holds the
+-- Gun first in a round is the sheriff, and anyone holding it after them picked it up
+-- off the sheriff's body. Loading the hub halfway through a round whose sheriff is
+-- already dead is the one case that mislabels, and there is no field to check it
+-- against, so it is left alone rather than guessed at.
+--==============================================================
+-- WHY THIS IS A FUNCTION AND NOT A do BLOCK
+--
+-- The first build of this used `do ... end` and died on load with
+--   Out of local registers when trying to allocate gunPool: exceeded limit 200
+-- A `do` block opens a new SCOPE but not a new register FRAME: its locals stack on
+-- top of whatever the main chunk is already holding. The top level of this file
+-- holds 159 locals for the whole run, so a do block here only ever had 41 registers
+-- to spend and this tab needs about 55 -- gunPool was simply the 201st name.
+--
+-- A function body is its own frame, so this gets a fresh 200. Upvalues (new, Bin,
+-- Cfg, livePool, ...) are counted separately against a 255 limit, so reaching out
+-- of here costs nothing. It is anonymous and self-calling so it adds ZERO top-level
+-- locals -- naming it would spend one of the 41 that are left.
+--
+-- The leading semicolon is load-bearing: the statement above ends in `)`, and
+-- `comingSoon(...)` followed by `(function() ... end)()` on the next line parses as
+-- calling comingSoon's RESULT. Do not delete it.
+--==============================================================
+;(function()
+	local ESP = addTab("ESP")
+
+	----------------------------------------------------------------
+	-- drawing surface
+	----------------------------------------------------------------
+	-- A Folder NEXT TO the window's ScreenGui, never inside it. Auto Claim Shells
+	-- disables that ScreenGui for a frame at a time to land a synthetic click, and
+	-- ESP that blinks off every time the shell loop fires reads as broken. wipeOld()
+	-- at the top of this file already destroys "ArjhayHubESP" by name, so a run that
+	-- dies without unloading cannot leave highlights on screen forever either.
+	local bag = new("Folder", { Name = "ArjhayHubESP", Parent = screen.Parent })
+
+	-- Tracers are 2D, so they need a LayerCollector of their own, and IgnoreGuiInset
+	-- stays FALSE on purpose: WorldToViewportPoint hands back points measured from
+	-- BELOW Roblox's top bar, while a ScreenGui that ignores the inset measures from
+	-- above it. Mixing the two puts every line 36px out -- the same inset trap the
+	-- shell clicker had to solve, just from the other side.
+	local lines = new("ScreenGui", {
+		Name = "Lines", Parent = bag, ResetOnSpawn = false, IgnoreGuiInset = false,
+		DisplayOrder = 9998, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+
+	-- new() does not pcall, so an unknown class would kill this whole block on the
+	-- way in. Ask once; without Highlight the tags and tracers still work alone.
+	local canHL = pcall(function() Instance.new("Highlight"):Destroy() end)
+
+	----------------------------------------------------------------
+	-- roles
+	----------------------------------------------------------------
+	local ROLE_COL = {
+		Murderer = Color3.fromRGB(235, 45, 55),
+		Sheriff  = Color3.fromRGB(60, 140, 255),
+		Hero     = Color3.fromRGB(255, 185, 60),
+		Innocent = Color3.fromRGB(70, 215, 120),
+		Unknown  = Color3.fromRGB(150, 150, 160),
+	}
+	local ROLE_OPTS   = { "Murderer", "Sheriff", "Hero", "Innocent", "Unknown" }
+	local DETAIL_OPTS = { "Name", "Role", "Distance", "Health" }
+
+	-- Tool names. Toys is the emote tool that everybody carries, so it is not here.
+	local WEAPON_ROLE = { Knife = "Murderer", Gun = "Sheriff" }
+
+	-- Both containers, because a Tool sits in the Backpack until it is equipped and
+	-- in the Character after. Iterating beats FindFirstChildOfClass("Tool"): a
+	-- murderer with the Toys out would answer "Toys" to that question and read as an
+	-- innocent for as long as they kept it out.
+	local function weaponOf(plr)
+		local char = plr.Character
+		if char then
+			for _, t in ipairs(char:GetChildren()) do
+				if WEAPON_ROLE[t.Name] and t:IsA("Tool") then return t.Name end
+			end
+		end
+		local bp = plr:FindFirstChild("Backpack")
+		if bp then
+			for _, t in ipairs(bp:GetChildren()) do
+				if WEAPON_ROLE[t.Name] and t:IsA("Tool") then return t.Name end
+			end
+		end
+		return nil
+	end
+
+	----------------------------------------------------------------
+	-- round state
+	----------------------------------------------------------------
+	-- Two independent sources, deliberately.
+	--   · the remotes are the precise answer, and the dump caught VictoryScreen and
+	--     RoundEndFade genuinely arriving
+	--   · but the hub is normally injected MID-round, and then no RoundStart ever
+	--     fires. So "somebody is holding a knife" stands as a backstop: it cannot be
+	--     true between rounds and it is true for every second of one.
+	-- Without the backstop a mid-round load would call the entire lobby Unknown, and
+	-- the user would quite reasonably read that as the feature being broken.
+	local roundFlag = false
+	local gunFirst  = nil            -- Player who held the Gun first this round
+
+	local ROUND_ON  = { RoundStart = true, CoinsStarted = true }
+	local ROUND_OFF = { VictoryScreen = true, GameOver = true, RoundEndFade = true }
+
+	-- Looked up by NAME rather than by a hard-coded folder path. The dump found its
+	-- remotes by walking four different roots and printed full paths, so writing
+	-- ReplicatedStorage.Remotes.Gameplay.X here would be me guessing at which folder
+	-- it was -- and a path that is one folder off fails SILENTLY: the knife backstop
+	-- below would quietly cover for it and the round flag would simply never update.
+	do
+		local found, hits = {}, 0
+
+		local function sweep(root)
+			if not root then return end
+			pcall(function()
+				for _, d in ipairs(root:GetDescendants()) do
+					if (ROUND_ON[d.Name] or ROUND_OFF[d.Name])
+						and found[d.Name] == nil and d:IsA("RemoteEvent") then
+						found[d.Name], hits = d, hits + 1
+					end
+				end
+			end)
+		end
+
+		sweep(ReplicatedStorage)
+		pcall(function() sweep(game:GetService("ReplicatedFirst")) end)
+		-- workspace only as a last resort: that walk is tens of thousands of instances
+		-- and there is no reason to pay for it if the events are where they should be.
+		if hits == 0 then sweep(workspace) end
+
+		-- OnClientEvent takes any number of listeners, so this cannot disturb the
+		-- game's own handlers, and it only ever listens -- nothing in this whole tab
+		-- fires anything at the server.
+		for name, r in pairs(found) do
+			local want = ROUND_ON[name] and true or false
+			Bin.conn(r.OnClientEvent:Connect(function()
+				roundFlag = want
+				if want then gunFirst = nil end
+			end))
+		end
+	end
+
+	-- One walk per pass: every player's weapon, plus whether a knife exists at all,
+	-- which is the round-live backstop above.
+	local function scanWeapons()
+		local map, knifeOut = {}, false
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local w = weaponOf(plr)
+			if w then
+				map[plr] = w
+				if w == "Knife" then knifeOut = true end
+			end
+		end
+		return map, knifeOut
+	end
+
+	local function roleOf(plr, weapon, live)
+		if weapon == "Knife" then return "Murderer" end
+		if weapon == "Gun" then
+			-- There is only ever one gun, so the first holder of the round is the
+			-- sheriff and anyone holding it later took it off the sheriff's body.
+			-- If that sheriff has since left the server the reference is dropped and
+			-- the current holder inherits the label -- wrong in principle, but a
+			-- stale Player reference held for the rest of the round is worse.
+			if gunFirst == nil or gunFirst.Parent ~= Players then gunFirst = plr end
+			return (gunFirst == plr) and "Sheriff" or "Hero"
+		end
+		return live and "Innocent" or "Unknown"
+	end
+
+	----------------------------------------------------------------
+	-- state the controls write and the passes read
+	----------------------------------------------------------------
+	local on        = false
+	local showSelf  = false
+	local maxDist   = 0              -- 0 means no limit
+	local useHL     = true
+	local fillPct   = 55
+	local thruWalls = true
+	local useTags   = true
+	local useTracer = false
+	local coinsOn   = false
+	local gunOn     = false
+
+	-- These two alias the dropdowns' own selection tables. api:Set builds a NEW table
+	-- and then re-fires the callback, so the alias is refreshed on every change and on
+	-- config load -- the same pattern the Farm tab's Target dropdown uses. They must
+	-- start out matching the dropdown defaults exactly, because construction refreshes
+	-- silently and the callback does not run until something is actually tapped.
+	local showRoles = {
+		Murderer = true, Sheriff = true, Hero = true, Innocent = true, Unknown = true,
+	}
+	local detail = { Name = true, Role = true, Distance = true }
+
+	----------------------------------------------------------------
+	-- drawables
+	----------------------------------------------------------------
+	-- One entry per player, built when their character appears and destroyed when it
+	-- goes. The range and role filters only flip Enabled: tearing a Highlight down and
+	-- rebuilding it every time somebody steps over the distance line would churn
+	-- instances several times a second and flicker on the boundary.
+	local drawn    = {}             -- Player   -> entry
+	local coinDots = {}             -- Instance -> BillboardGui
+	local gunMarks = {}             -- Instance -> { tag, hl }
+
+	local function makeEntry()
+		local e = {}
+		if canHL then
+			e.hl = new("Highlight", {
+				Parent = bag, Enabled = false,
+				FillTransparency = 0.45, OutlineTransparency = 0,
+			})
+		end
+		-- MaxDistance is set explicitly rather than left to the default. A tag that
+		-- quietly fades out past some distance is the single most confusing thing an
+		-- ESP can do -- it looks exactly like the role detection having failed.
+		e.tag = new("BillboardGui", {
+			Parent = bag, Enabled = false, AlwaysOnTop = true, LightInfluence = 0,
+			MaxDistance = math.huge,
+			Size = UDim2.fromOffset(240, 44), StudsOffset = Vector3.new(0, 2.4, 0),
+		})
+		e.txt = new("TextLabel", {
+			Parent = e.tag, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+			Font = FONT_B, Text = "", TextSize = 13, TextColor3 = T.Text,
+			TextStrokeColor3 = Color3.new(0, 0, 0), TextStrokeTransparency = 0.4,
+		})
+		e.line = new("Frame", {
+			Parent = lines, Visible = false, BorderSizePixel = 0,
+			AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(2, 0),
+			BackgroundColor3 = T.Accent, BackgroundTransparency = 0.25,
+		})
+		return e
+	end
+
+	-- e.txt is a child of e.tag, so destroying the tag takes the label with it.
+	local function killEntry(plr)
+		local e = drawn[plr]
+		if not e then return end
+		drawn[plr] = nil
+		for _, k in ipairs({ "hl", "tag", "line" }) do
+			local inst = e[k]
+			if inst then pcall(function() inst:Destroy() end) end
+		end
+	end
+
+	-- A dot, not a Highlight. Roblox stops rendering past roughly 31 Highlights in a
+	-- scene, and a busy MM2 map carries far more coins than that -- highlighting coins
+	-- would silently blank the PLAYERS along with them.
+	local function makeDot(col, px)
+		local g = new("BillboardGui", {
+			Parent = bag, Enabled = false, AlwaysOnTop = true, LightInfluence = 0,
+			MaxDistance = math.huge, Size = UDim2.fromOffset(px, px),
+		})
+		local d = new("Frame", {
+			Parent = g, BorderSizePixel = 0, BackgroundColor3 = col,
+			Size = UDim2.fromScale(1, 1),
+		})
+		corner(d, math.floor(px / 2))
+		stroke(d, Color3.new(0, 0, 0), 1)
+		return g
+	end
+
+	-- ASCII only. A glyph the device's font happens to lack draws as an empty box,
+	-- which is why every icon in this hub is a Frame; a name tag is the one place text
+	-- is unavoidable, so it stays inside the safe range.
+	local function tagText(plr, role, dist, hum)
+		local top, bits = (detail.Name and plr.Name or ""), {}
+		if detail.Role then bits[#bits + 1] = role end
+		if detail.Distance and dist then
+			bits[#bits + 1] = string.format("%d studs", math.floor(dist + 0.5))
+		end
+		if detail.Health and hum then
+			bits[#bits + 1] = string.format("%d hp", math.floor(hum.Health + 0.5))
+		end
+		local low = table.concat(bits, "  |  ")
+		if top == "" then return low end
+		if low == "" then return top end
+		return top .. "\n" .. low
+	end
+
+	----------------------------------------------------------------
+	-- teardown helpers
+	----------------------------------------------------------------
+	-- Every one of these SWAPS the table for a fresh one and walks the old copy,
+	-- rather than clearing keys while iterating. Same reason as the plant bookkeeping
+	-- in the other hub: it is the one shape that cannot raise "invalid key to next".
+	local function dropPlayers()
+		if next(drawn) == nil then return end
+		local old = drawn
+		drawn = {}
+		for _, e in pairs(old) do
+			for _, k in ipairs({ "hl", "tag", "line" }) do
+				local inst = e[k]
+				if inst then pcall(function() inst:Destroy() end) end
+			end
+		end
+	end
+
+	local function dropCoins()
+		if next(coinDots) == nil then return end
+		local old = coinDots
+		coinDots = {}
+		for _, g in pairs(old) do pcall(function() g:Destroy() end) end
+	end
+
+	local function dropGuns()
+		if next(gunMarks) == nil then return end
+		local old = gunMarks
+		gunMarks = {}
+		for _, m in pairs(old) do
+			for _, k in ipairs({ "tag", "hl" }) do
+				local inst = m[k]
+				if inst then pcall(function() inst:Destroy() end) end
+			end
+		end
+	end
+
+	----------------------------------------------------------------
+	-- the player pass
+	----------------------------------------------------------------
+	local function playerPass(origin)
+		local weapons, knifeOut = scanWeapons()
+		local live = roundFlag or knifeOut
+		local seen = {}
+
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local char = plr.Character
+			local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+			local hum  = char and char:FindFirstChildOfClass("Humanoid")
+			-- IsDescendantOf(workspace), not .Parent ~= nil: a character sitting
+			-- inside a model the game has already destroyed still answers .Parent and
+			-- still reports a Position. Treating that as alive is exactly what had the
+			-- coin collector chasing ghosts across a dead map.
+			local ok = char ~= nil and hrp ~= nil and char:IsDescendantOf(workspace)
+				and sanePos(hrp.Position) and (hum == nil or hum.Health > 0)
+
+			if ok and (showSelf or plr ~= LocalPlayer) then
+				seen[plr] = true
+				local e = drawn[plr]
+				if not e then
+					e = makeEntry()
+					drawn[plr] = e
+				end
+
+				local role = roleOf(plr, weapons[plr], live)
+				local col  = ROLE_COL[role] or ROLE_COL.Unknown
+				local dist = origin and (hrp.Position - origin).Magnitude or nil
+				local show = (showRoles[role] == true)
+					and ((maxDist <= 0) or dist == nil or dist <= maxDist)
+
+				e.part, e.on = hrp, show
+
+				if e.hl then
+					local hlOn = show and useHL
+					e.hl.Enabled = hlOn
+					e.hl.Adornee = hlOn and char or nil
+					if hlOn then
+						e.hl.FillColor        = col
+						e.hl.OutlineColor     = col
+						e.hl.FillTransparency = 1 - (fillPct / 100)
+						e.hl.DepthMode        = thruWalls
+							and Enum.HighlightDepthMode.AlwaysOnTop
+							or Enum.HighlightDepthMode.Occluded
+					end
+				end
+
+				local tagOn = show and useTags
+				e.tag.Enabled = tagOn
+				e.tag.Adornee = tagOn and (char:FindFirstChild("Head") or hrp) or nil
+				if tagOn then
+					e.txt.Text       = tagText(plr, role, dist, hum)
+					e.txt.TextColor3 = col
+				end
+
+				e.line.BackgroundColor3 = col
+				if not (show and useTracer) then e.line.Visible = false end
+			end
+		end
+
+		-- A player who left, died or respawned stops having drawables at all. The
+		-- filters above only ever flip Enabled, so this list is the only thing in the
+		-- pass that destroys anything.
+		local gone
+		for plr in pairs(drawn) do
+			if not seen[plr] then
+				gone = gone or {}
+				gone[#gone + 1] = plr
+			end
+		end
+		if gone then
+			for _, plr in ipairs(gone) do killEntry(plr) end
+		end
+	end
+
+	----------------------------------------------------------------
+	-- the coin pass
+	----------------------------------------------------------------
+	local COIN_CAP = 90
+
+	local function coinPass(origin)
+		local seen, n = {}, 0
+		-- livePool() is the collector's own pool: cached for a tenth of a second,
+		-- already immune to the destroyed-map ghost coins, and it follows the Farm
+		-- tab's Target dropdown. So the ESP marks exactly what Auto Collect Coins
+		-- would go for, which is the useful answer rather than a second opinion.
+		for _, inst in ipairs(livePool(false)) do
+			if n >= COIN_CAP then break end
+			local part = alive(inst) and partOf(inst) or nil
+			if part and sanePos(part.Position) then
+				local d = origin and (part.Position - origin).Magnitude or nil
+				if (maxDist <= 0) or d == nil or d <= maxDist then
+					n = n + 1
+					seen[inst] = true
+					local g = coinDots[inst]
+					if not g then
+						g = makeDot(Color3.fromRGB(255, 205, 60), 10)
+						coinDots[inst] = g
+					end
+					g.Adornee = part
+					g.Enabled = true
+				end
+			end
+		end
+		-- Strong keys, not weak ones: a weak key would let a collected coin take its
+		-- table row away while the BillboardGui was still parented to the Folder, and
+		-- then nothing on this side would ever hold a reference to destroy. A coin
+		-- that leaves the pool is unmarked here instead, one pass later at most.
+		local gone
+		for inst in pairs(coinDots) do
+			if not seen[inst] then
+				gone = gone or {}
+				gone[#gone + 1] = inst
+			end
+		end
+		if gone then
+			for _, inst in ipairs(gone) do
+				local g = coinDots[inst]
+				coinDots[inst] = nil
+				if g then pcall(function() g:Destroy() end) end
+			end
+		end
+	end
+
+	----------------------------------------------------------------
+	-- the dropped-gun pass
+	----------------------------------------------------------------
+	-- The dropped gun is the one thing in this tab the dump does NOT confirm: the
+	-- round it watched ended on the clock, so the sheriff never died and nothing was
+	-- ever dropped. This is a name scan rather than a known path, throttled like the
+	-- coin container walk, and a wrong guess costs a marker that never appears --
+	-- never a misfire, because nothing in here touches or fires anything.
+	local GUN_NAMES = { Gun = true, GunDrop = true, DroppedGun = true, GunPickup = true }
+	local gunPool, gunStamp = {}, -1e9
+
+	local function heldBySomebody(inst)
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local c = plr.Character
+			if c and inst:IsDescendantOf(c) then return true end
+		end
+		return false
+	end
+
+	local function rebuildGuns()
+		local out = {}
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if GUN_NAMES[baseName(inst.Name)]
+				and (inst:IsA("Tool") or inst:IsA("Model") or inst:IsA("BasePart"))
+				and not heldBySomebody(inst) then
+				out[#out + 1] = inst
+			end
+		end
+		gunPool, gunStamp = out, os.clock()
+	end
+
+	local function gunPass(origin)
+		-- Only ever while the toggle is on: this is a full workspace descendant walk
+		-- and there is no reason to pay for it otherwise.
+		if (os.clock() - gunStamp) > 4 then rebuildGuns() end
+		local seen = {}
+		for _, inst in ipairs(gunPool) do
+			local part = alive(inst) and partOf(inst) or nil
+			if part and sanePos(part.Position) and not heldBySomebody(inst) then
+				local d = origin and (part.Position - origin).Magnitude or nil
+				if (maxDist <= 0) or d == nil or d <= maxDist then
+					seen[inst] = true
+					local m = gunMarks[inst]
+					if not m then
+						m = { tag = makeDot(ROLE_COL.Sheriff, 14) }
+						if canHL then
+							m.hl = new("Highlight", {
+								Parent = bag, Enabled = true,
+								FillColor        = ROLE_COL.Sheriff,
+								OutlineColor     = ROLE_COL.Sheriff,
+								FillTransparency = 0.4, OutlineTransparency = 0,
+								DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+							})
+						end
+						gunMarks[inst] = m
+					end
+					m.tag.Adornee = part
+					m.tag.Enabled = true
+					if m.hl then
+						m.hl.Adornee = inst:IsA("Model") and inst or part
+					end
+				end
+			end
+		end
+		local gone
+		for inst in pairs(gunMarks) do
+			if not seen[inst] then
+				gone = gone or {}
+				gone[#gone + 1] = inst
+			end
+		end
+		if gone then
+			for _, inst in ipairs(gone) do
+				local m = gunMarks[inst]
+				gunMarks[inst] = nil
+				if m then
+					for _, k in ipairs({ "tag", "hl" }) do
+						if m[k] then pcall(function() m[k]:Destroy() end) end
+					end
+				end
+			end
+		end
+	end
+
+	----------------------------------------------------------------
+	-- tracers
+	----------------------------------------------------------------
+	-- Geometry every frame, because a line that lags the camera by 150ms looks worse
+	-- than no line at all. Everything expensive happens on the slow pass instead.
+	local function linePass(cam)
+		if not cam then return end
+		local vp     = cam.ViewportSize
+		local ox, oy = vp.X * 0.5, vp.Y
+		for _, e in pairs(drawn) do
+			local part = e.part
+			if useTracer and e.on and part and part.Parent then
+				local sp = cam:WorldToViewportPoint(part.Position)
+				-- The Z of that result, not the visible-on-screen flag it also returns:
+				-- Z is depth in front of the camera, and a tracer to somebody who is
+				-- OFF screen is the whole point of drawing one. Using the flag would
+				-- hide every line the moment the target left the frame, which is the
+				-- exact moment it becomes useful. Behind the camera (Z <= 0) still has
+				-- to go, because the projection flips there and the line would confidently
+				-- point the wrong way.
+				if sp.Z > 0 then
+					local dx, dy = sp.X - ox, sp.Y - oy
+					local len    = math.sqrt(dx * dx + dy * dy)
+					e.line.Size     = UDim2.fromOffset(2, len)
+					e.line.Position = UDim2.fromOffset(ox + dx * 0.5, oy + dy * 0.5)
+					-- a Frame's long axis runs down the screen, so take off the
+					-- quarter turn that atan2 does not know about
+					e.line.Rotation = math.deg(math.atan2(dy, dx)) - 90
+					e.line.Visible  = true
+				else
+					e.line.Visible = false
+				end
+			elseif e.line.Visible then
+				e.line.Visible = false
+			end
+		end
+	end
+
+	----------------------------------------------------------------
+	-- the driver
+	----------------------------------------------------------------
+	local REFRESH = 0.15
+	local acc, drive = 0, nil
+
+	local function step(dt)
+		local cam = workspace.CurrentCamera
+		acc = acc + dt
+		if acc >= REFRESH then
+			acc = 0
+			local hrp = myRoot()
+			-- A dead spectator has no root part, and the camera is then the honest
+			-- origin for "how far is that" -- it is where the user is looking from.
+			local origin = (hrp and hrp.Position) or (cam and cam.CFrame.Position) or nil
+			if origin and not sanePos(origin) then origin = nil end
+
+			playerPass(origin)
+			if coinsOn then coinPass(origin) else dropCoins() end
+			if gunOn then gunPass(origin) else dropGuns() end
+		end
+		linePass(cam)
+	end
+
+	-- The driver is one RenderStepped connection and it is deliberately NOT handed to
+	-- Bin.conn: that list only ever grows, so a toggle flicked twenty times would
+	-- leave twenty dead connections sitting in it. It lives in a local with its own
+	-- onUnload, the same shape the coin driver uses.
+	local function setEsp(v)
+		on = v and true or false
+		if on then
+			if not drive then
+				acc = REFRESH        -- draw on the very next frame, not in 150ms
+				drive = RunService.RenderStepped:Connect(step)
+			end
+		else
+			if drive then
+				pcall(function() drive:Disconnect() end)
+				drive = nil
+			end
+			dropPlayers()
+			dropCoins()
+			dropGuns()
+		end
+	end
+
+	Bin.conn(Players.PlayerRemoving:Connect(function(plr)
+		killEntry(plr)
+		if gunFirst == plr then gunFirst = nil end
+	end))
+
+	Bin.onUnload(function()
+		on = false
+		if drive then
+			pcall(function() drive:Disconnect() end)
+			drive = nil
+		end
+		-- Destroying the Folder takes every Highlight, tag, dot and tracer with it in
+		-- one go. The tables still have to be emptied by hand: the RenderStepped
+		-- closure above holds all three, and the control callbacks that hold it are
+		-- reachable from Cfg, which is handed out through getgenv() and outlives the
+		-- close button. A table left full of destroyed Instances pins them for the
+		-- rest of the session.
+		dropPlayers()
+		dropCoins()
+		dropGuns()
+		gunPool, gunFirst = {}, nil
+		pcall(function() bag:Destroy() end)
+	end)
+
+	----------------------------------------------------------------
+	-- Player ESP
+	----------------------------------------------------------------
+	local main = ESP:Section("Player ESP")
+	main.card.LayoutOrder = 1
+
+	main:Label("Roles come from the Knife and Gun tools, because MM2 sends nobody"
+		.. " else's role to your client. The backpack replicates, so the murderer"
+		.. " shows up when the round starts rather than when they first swing.")
+
+	main:Label("Between rounds nobody is carrying a weapon, so everyone reads"
+		.. " Unknown. Untick that role to only draw once a round is running.")
+
+	Cfg.add("esp.players.enabled", "toggle",
+	main:Toggle("Player ESP", false, function(v) setEsp(v) end))
+
+	Cfg.add("esp.players.roles", "dropdown",
+	main:Dropdown("Show Roles", ROLE_OPTS, ROLE_OPTS, function(set)
+		showRoles = set
+	end))
+
+	Cfg.add("esp.players.self", "toggle",
+	main:Toggle("Include Yourself", false, function(v) showSelf = v end))
+
+	Cfg.add("esp.players.range", "slider",
+	main:Slider("Max Distance (0 = no limit)", 0, 2000, 0, function(v)
+		maxDist = v
+	end))
+
+	----------------------------------------------------------------
+	-- ESP Style
+	----------------------------------------------------------------
+	local style = ESP:Section("ESP Style")
+	style.card.LayoutOrder = 2
+
+	if not canHL then
+		style:Label("This client has no Highlight class, so the character glow is"
+			.. " unavailable here. Name tags and tracers still work.")
+	end
+
+	Cfg.add("esp.style.highlight", "toggle",
+	style:Toggle("Highlight Characters", true, function(v) useHL = v end))
+
+	Cfg.add("esp.style.fill", "slider",
+	style:Slider("Highlight Fill", 0, 100, 55, function(v) fillPct = v end))
+
+	Cfg.add("esp.style.walls", "toggle",
+	style:Toggle("Draw Through Walls", true, function(v) thruWalls = v end))
+
+	Cfg.add("esp.style.tags", "toggle",
+	style:Toggle("Name Tags", true, function(v) useTags = v end))
+
+	Cfg.add("esp.style.detail", "dropdown",
+	style:Dropdown("Tag Shows", DETAIL_OPTS, { "Name", "Role", "Distance" },
+	function(set)
+		detail = set
+	end))
+
+	Cfg.add("esp.style.tracers", "toggle",
+	style:Toggle("Tracers", false, function(v) useTracer = v end))
+
+	----------------------------------------------------------------
+	-- Object ESP
+	----------------------------------------------------------------
+	local objects = ESP:Section("Object ESP")
+	objects.card.LayoutOrder = 3
+
+	objects:Label("Coins are marked with dots rather than glows on purpose: Roblox"
+		.. " stops drawing highlights past about thirty of them, and a map holds far"
+		.. " more coins than that. They follow the Farm tab's Target setting.")
+
+	Cfg.add("esp.objects.coins", "toggle",
+	objects:Toggle("Coin ESP", false, function(v)
+		coinsOn = v
+		if not v then dropCoins() end
+	end))
+
+	Cfg.add("esp.objects.gun", "toggle",
+	objects:Toggle("Dropped Gun ESP", false, function(v)
+		gunOn = v
+		if v then gunStamp = -1e9 else dropGuns() end
+	end))
+
+	objects:Label("The dropped gun is a name guess, not a confirmed path -- the round"
+		.. " the dump watched ended on the clock, so no gun was ever dropped to look"
+		.. " at. If it never marks anything, that is why.")
+end)()
+
+--==============================================================
+-- AUTO PICK DEVICE   (the Android "Choose Your Device" popup)
+--==============================================================
+-- No toggle and no button, by request: it just happens. A thing you always want has
+-- no business being a switch.
+--
+-- WHY THIS IS SO PARANOID
+-- The popup's own warning is "Choosing the wrong device will mess up your menu --
+-- rejoin if you select the wrong device", so a misfire is not a no-op, it costs a
+-- rejoin. Nothing about this GUI has been dumped, so every name in here is a guess,
+-- and a guess that presses SOMETHING is far worse than one that presses nothing:
+--   * "phone" is matched as a whole WORD, tokenised, never as a substring -- a
+--     substring test fires on "Headphones" and "iPhone 12" just as happily.
+--   * a phone-looking panel is not enough on its own. It only counts as a device
+--     chooser when a RIVAL device word (tablet / pc / console / ...) is on screen in
+--     an enclosing panel, or the "choose your device" title is. One word alone could
+--     be any settings menu in the game.
+--   * the chosen panel must contain "phone" and NO rival word. That is also what
+--     rejects the wrapper holding BOTH panels -- it contains both words, so it is
+--     never mistaken for the button.
+--   * if two different panels both look like the phone one it presses NEITHER and
+--     writes a report. Ambiguity is a dump, never a coin flip.
+--   * handlers are tried before coordinates, because firing a button's own signal
+--     cannot physically land on its neighbour.
+--   * the inset variants only ever move the click VERTICALLY (36px), and the two
+--     panels sit side by side, so even a wrong inset guess cannot press Tablet.
+--     That is the only reason coordinate fallbacks are allowed here at all.
+--
+-- COST
+-- Polling PlayerGui forever for a popup that only shows at join would be rude, so
+-- this is ARMED rather than permanent: fast for 45s, slow until a 3 minute deadline,
+-- then the loop simply ends and costs nothing. A new ScreenGui arriving in PlayerGui
+-- re-arms it, which is the only cheap signal that a new popup might exist. The
+-- expensive checks all sit behind a keyword prefilter, so a normal tick is one
+-- GetDescendants walk and a string.find per text node.
+--==============================================================
+;(function()
+	local WANT   = "phone"
+	-- Whole words only, and deliberately NOT "switch": the tablet panel reads
+	-- "Touch to switch", so treating that as a device word would reject the real
+	-- phone panel the moment the layout put the same hint on its side.
+	local RIVALS = {
+		tablet = true, ipad = true, pc = true, computer = true, laptop = true,
+		desktop = true, console = true, xbox = true, playstation = true,
+	}
+	local DENY = {
+		buy = true, purchase = true, robux = true, gamepass = true, premium = true,
+		upgrade = true, shop = true,
+	}
+	-- Proof that a device chooser is what is on screen. The title is the obvious one,
+	-- but the other three are the strings the popup itself puts on the panels and in
+	-- its red warning line, and they matter: if the Tablet panel happens to sit more
+	-- than HOPS levels away from the Phone panel there is no shared wrapper to find,
+	-- and without one of these the feature would decide "not a chooser" and do
+	-- nothing at all -- silently, which is the worst outcome available.
+	local TITLE_BITS = {
+		"choose your device", "select your device", "choose device",
+		"previous device", "touch to switch", "wrong device",
+	}
+
+	local HOPS       = 8            -- ancestors walked up from a phone label
+	local FAST, SLOW = 0.4, 1.5
+	local FAST_FOR   = 45           -- seconds of fast polling per arming
+	local LIFETIME   = 180          -- seconds before the loop gives up entirely
+	local DUMP_PATH  = "ArjhayHub_MM2_device.txt"
+
+	local wantLoop, busy = true, false
+	local picked, dumped = false, false
+	local armUntil, deadline, lastWarn = 0, 0, 0
+	local tried = setmetatable({}, { __mode = "k" })   -- panel -> os.clock() pressed
+
+	local function isTextNode(d)
+		return d:IsA("TextLabel") or d:IsA("TextButton")
+	end
+
+	local function wordsOf(inst, into)
+		local t = inst.Text
+		if type(t) == "string" and #t > 0 and #t <= 200 then
+			for w in string.gmatch(string.lower(t), "%a+") do into[w] = true end
+		end
+		return into
+	end
+
+	-- Every word in a subtree. The cap bounds the ITERATION, not GetDescendants'
+	-- allocation, which is fine: this only ever runs once a visible "phone" word
+	-- exists, which in practice means the popup is already up.
+	local function subtreeWords(root, cap)
+		local out = {}
+		if isTextNode(root) then wordsOf(root, out) end
+		local n = 0
+		for _, d in ipairs(root:GetDescendants()) do
+			n = n + 1
+			if n > cap then break end
+			if isTextNode(d) then wordsOf(d, out) end
+		end
+		return out
+	end
+
+	local function anyWord(set, list)
+		for w in pairs(list) do
+			if set[w] then return w end
+		end
+		return nil
+	end
+
+	----------------------------------------------------------------
+	-- the report, for when the guesswork does not pan out
+	----------------------------------------------------------------
+	-- Console text cannot be copied out, so a failure has to land in a file or it
+	-- may as well not have been reported. Once per session, and capped so the result
+	-- is small enough to actually send.
+	local function dumpDevice(pg, why)
+		if dumped then return end
+		dumped = true
+		if type(writefile) ~= "function" then
+			warn("[Arjhay Hub] device: " .. why .. " -- no writefile, cannot report")
+			return
+		end
+		local out = {}
+		table.insert(out, "Arjhay Hub -- Choose Your Device report")
+		table.insert(out, "why: " .. why)
+		table.insert(out, "looking for the whole word: " .. WANT)
+		table.insert(out, "")
+		table.insert(out, "== visible text on screen ==")
+		local n = 0
+		for _, d in ipairs(pg:GetDescendants()) do
+			if isTextNode(d) and #d.Text > 0 and n < 150 then
+				local ok, vis = pcall(trulyVisible, d)
+				if ok and vis then
+					n = n + 1
+					table.insert(out, string.format(
+						"%3d  %-12s %-22s pos=%d,%d  size=%dx%d  text=%s",
+						n, d.ClassName, d.Name,
+						math.floor(d.AbsolutePosition.X), math.floor(d.AbsolutePosition.Y),
+						math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y), d.Text))
+					table.insert(out, "     " .. d:GetFullName())
+				end
+			end
+		end
+		if n == 0 then table.insert(out, "(nothing visible with text)") end
+		table.insert(out, "")
+		table.insert(out, "== visible buttons ==")
+		local b = 0
+		for _, d in ipairs(pg:GetDescendants()) do
+			if d:IsA("GuiButton") and b < 80 then
+				local ok, vis = pcall(trulyVisible, d)
+				if ok and vis then
+					b = b + 1
+					table.insert(out, string.format("%3d  %-12s %-22s pos=%d,%d  size=%dx%d",
+						b, d.ClassName, d.Name,
+						math.floor(d.AbsolutePosition.X), math.floor(d.AbsolutePosition.Y),
+						math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y)))
+					table.insert(out, "     " .. d:GetFullName())
+				end
+			end
+		end
+		if b == 0 then table.insert(out, "(no visible buttons at all -- the panels are")
+			table.insert(out, " plain Frames, so the click has to be by coordinate)")
+		end
+		if pcall(writefile, DUMP_PATH, table.concat(out, "\n")) then
+			warn("[Arjhay Hub] device: " .. why .. " -- wrote " .. DUMP_PATH)
+		else
+			warn("[Arjhay Hub] device: " .. why .. " -- writefile failed")
+		end
+	end
+
+	----------------------------------------------------------------
+	-- one sweep
+	----------------------------------------------------------------
+	local function scan()
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if not pg then return "no playergui" end
+
+		-- ONE walk. trulyVisible is expensive per node (it climbs to the root), so it
+		-- only ever runs on a node whose text already matched a keyword.
+		local phones, titled = {}, false
+		for _, d in ipairs(pg:GetDescendants()) do
+			if isTextNode(d) then
+				local raw = d.Text
+				if #raw > 0 and #raw <= 200 then
+					local low = string.lower(raw)
+					if not titled then
+						for _, bit in ipairs(TITLE_BITS) do
+							if string.find(low, bit, 1, true) and trulyVisible(d) then
+								titled = true
+								break
+							end
+						end
+					end
+					if string.find(low, WANT, 1, true) then
+						local w = {}
+						for x in string.gmatch(low, "%a+") do w[x] = true end
+						if w[WANT] and trulyVisible(d) then table.insert(phones, d) end
+					end
+				end
+			end
+		end
+		if #phones == 0 then return "no phone label" end
+
+		-- Climb from each phone label. The first ancestor that also contains a rival
+		-- device word is the WRAPPER holding both panels, so everything below it is
+		-- the phone side. Never climb past a LayerCollector -- the popup cannot be
+		-- wider than its own ScreenGui.
+		local best, bestWrap, clashed, sawChooser = nil, nil, false, false
+		for _, lab in ipairs(phones) do
+			local chain, wrap = {}, nil
+			local node, hops = lab, 0
+			while node and node ~= pg and hops <= HOPS do
+				if node:IsA("LayerCollector") then break end
+				if node:IsA("GuiObject") then
+					if anyWord(subtreeWords(node, 400), RIVALS) then wrap = node; break end
+					table.insert(chain, node)
+				end
+				node, hops = node.Parent, hops + 1
+			end
+
+			-- A lone "Phone" word with no rival above it and no title on screen is
+			-- not a device chooser, it is just a word. Leave it alone.
+			if (wrap or titled) and #chain > 0 then
+				sawChooser = true
+				-- outermost button below the wrapper: the whole panel is usually the
+				-- clickable thing and the label inside it may be a button too
+				local target = nil
+				for i = #chain, 1, -1 do
+					if chain[i]:IsA("GuiButton") then target = chain[i]; break end
+				end
+				target = target or chain[#chain]
+
+				local tw = subtreeWords(target, 400)
+				if tw[WANT] and not anyWord(tw, RIVALS) and not anyWord(tw, DENY) then
+					if best == nil then
+						best, bestWrap = target, wrap
+					elseif best ~= target then
+						clashed = true
+					end
+				end
+			end
+		end
+
+		if clashed then
+			dumpDevice(pg, "two different panels both look like Phone")
+			return "ambiguous"
+		end
+		if not best then
+			-- Context said "device chooser" and still nothing under the phone label
+			-- passed the word test. Returning quietly here is exactly how a feature
+			-- dies silently, so this is the case that has to leave a file behind.
+			if sawChooser then
+				dumpDevice(pg, "chooser is on screen but no panel passed the word test")
+				return "unresolved"
+			end
+			return "no chooser context"
+		end
+
+		local stamp = tried[best]
+		if stamp and (os.clock() - stamp) < 3 then return "cooling down" end
+		tried[best] = os.clock()
+
+		-- A press counts only when the popup actually goes away. pcall not throwing
+		-- proves nothing -- that lesson came from the shells clicker.
+		local wrap = bestWrap or best
+		local function gone()
+			if best.Parent == nil or wrap.Parent == nil then return true end
+			local okW, visW = pcall(trulyVisible, wrap)
+			if okW and not visW then return true end
+			local okB, visB = pcall(trulyVisible, best)
+			return okB and not visB
+		end
+		if gone() then return "already gone" end
+
+		local ways = {}
+		if best:IsA("GuiButton") then
+			table.insert(ways, { "handlers", function() return fireHandlers(best) end })
+		end
+		table.insert(ways, { "click", function() return sendClick(best, insetApplies(best)) end })
+		table.insert(ways, { "click+inset", function() return sendClick(best, true) end })
+		table.insert(ways, { "click-raw", function() return sendClick(best, false) end })
+
+		for _, way in ipairs(ways) do
+			way[2]()
+			task.wait(0.15)                 -- let the popup react before judging
+			if gone() then
+				print("[Arjhay Hub] device: chose Phone via " .. way[1] .. ".")
+				return "picked"
+			end
+		end
+		dumpDevice(pg, "found the Phone panel but nothing closed the popup")
+		return "all methods missed"
+	end
+
+	----------------------------------------------------------------
+	-- driver
+	----------------------------------------------------------------
+	local function loop()
+		if busy then return end
+		busy = true
+		while wantLoop and not picked and os.clock() < deadline do
+			local ok, res = pcall(scan)
+			if not ok then
+				if os.clock() - lastWarn > 5 then      -- never spam at 0.4s
+					lastWarn = os.clock()
+					warn("[Arjhay Hub] device: " .. tostring(res))
+				end
+			elseif res == "picked" then
+				picked = true
+			end
+			task.wait((os.clock() < armUntil) and FAST or SLOW)
+		end
+		busy = false
+	end
+
+	local function arm()
+		armUntil = os.clock() + FAST_FOR
+		deadline = os.clock() + LIFETIME
+		if not busy and not picked then task.spawn(loop) end
+	end
+
+	-- The popup may also be up before the hub is injected, in which case the first
+	-- tick already catches it. This connection is for the other case: a chooser that
+	-- arrives later inside a ScreenGui of its own. It cannot see a popup that lives
+	-- in an ALREADY existing ScreenGui and merely gets re-enabled, which is why the
+	-- first arming polls for three minutes rather than trusting events.
+	local pgNow = LocalPlayer:FindFirstChild("PlayerGui")
+	if pgNow then
+		Bin.conn(pgNow.ChildAdded:Connect(function(child)
+			if child:IsA("LayerCollector") then arm() end
+		end))
+	end
+
+	-- while-loop, not a connection, so Bin.flush() cannot reach it: clear the flag
+	-- it spins on or it keeps polling after the close button
+	Bin.onUnload(function() wantLoop = false end)
+
+	-- dead last on purpose: task.spawn runs the worker up to its first yield
+	-- SYNCHRONOUSLY, so arming any earlier would let a press happen before the flag
+	-- that stops it was ever registered
+	arm()
+end)()
 
 --==============================================================
 -- open
