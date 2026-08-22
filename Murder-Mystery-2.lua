@@ -515,14 +515,20 @@ local function selectTab(tab)
 	end
 end
 
-local function addTab(name)
+-- `order` is the sidebar position, and passing it is not optional in practice: the
+-- tabs are built in whatever order their code happens to sit in this file, and one of
+-- them (Performance) is a 400-line IIFE that should not have to MOVE just because the
+-- sidebar should read differently. So order is a number at the call site, and
+-- reordering the hub is now editing six digits instead of cutting and pasting blocks.
+-- #tabs is kept as the fallback so an unnumbered tab still lands after the others.
+local function addTab(name, order)
 	local button = new("TextButton", {
 		Parent = sidebar, AutoButtonColor = false, Text = "",
 		Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Panel,
 		BackgroundTransparency = 1, BorderSizePixel = 0,
 		-- explicit, because the sidebar sorts by LayoutOrder and every button
 		-- defaulting to 0 leaves the running order down to child insertion
-		LayoutOrder = #tabs,
+		LayoutOrder = order or #tabs,
 	})
 	corner(button, 8)
 	local bar = new("Frame", {
@@ -1568,7 +1574,7 @@ end
 --==============================================================
 -- CONFIG TAB
 --==============================================================
-local Config = addTab("Config")
+local Config = addTab("Config", 1)
 
 -- Created before Farm so the sidebar reads Config, Farm, Combat, ESP top to
 -- bottom. Farm is still the tab the hub OPENS on, because it is the one that does
@@ -1758,7 +1764,7 @@ end
 --==============================================================
 -- FARM TAB   (renamed from "Main" by request)
 --==============================================================
-local Farm = addTab("Farm")
+local Farm = addTab("Farm", 2)
 
 --------------------------------------------------------------------
 -- Auto Collect Coins
@@ -1971,6 +1977,44 @@ local holdUntil  = 0                                    -- the deliberate stop, 
 local targetInst = nil                                  -- the coin we committed to fly at
 local charSeen   = setmetatable({}, { __mode = "k" })   -- characters we have already reset for
 
+-- THE STUCK BUG, and why it needed a table of its own.
+-- Reported as "sometimes my character stuck and cant get coins but when off and On it
+-- will fix the stuck". That last clause is the whole diagnosis: toggling off and on
+-- runs dropClaims() and startDrain(), so whatever wedges is (a) bookkeeping, not
+-- physics, and (b) something neither the driver nor the worker notices on its own.
+-- Two separate defects, and they feed each other:
+--
+--   1. THE WORKER COULD DIE IN SILENCE. startDrain()'s loop body was unprotected.
+--      One throw anywhere in it -- and it indexes instances that a round change can
+--      destroy underneath it -- ended the task for good. Nothing respawned it and
+--      nothing checked it was alive. From then on coins were claimed and never
+--      touched, which brings us to:
+--   2. THE BENCH THEN POISONED THE WHOLE POOL. A claim that goes unpaid for
+--      RECLAIM_AFTER counts as a refusal, and GIVE_UP_AFTER refusals bench a coin
+--      for BLOCK_FOR. With no worker firing, EVERY coin earns three refusals and
+--      goes to the bench, so `best` is nil forever, so coinFrame holdStill()s next to
+--      a full container. That is the "stuck". Off/On swaps the bench for a fresh
+--      table and starts a new worker, which is exactly why it looked like a fix.
+--
+--   ...and the same clock was wrong even with a healthy worker: it started when a
+--   coin JOINED THE QUEUE, not when its touch actually went out. At QUEUE_CAP the
+--   queue takes ~2s to drain at 60fps, which is longer than RECLAIM_AFTER, so a coin
+--   could be benched for the crime of waiting in line -- and be re-pushed while still
+--   queued, making the backlog worse. A bound the thing it bounds can invalidate, the
+--   same shape as the click storm in Auto Pick Device further down this file.
+--
+-- One table, not four locals: this file is near Luau's ceiling and Cfg set the
+-- precedent (see the note above Cfg).
+local Drain = {
+	fired   = setmetatable({}, { __mode = "k" }),   -- coin -> clock the touch ACTUALLY went out
+	queued  = setmetatable({}, { __mode = "k" }),   -- coin -> true while it sits in claimQueue
+	stamp   = 0,                                    -- worker heartbeat; the watchdog reads this
+	stuck   = 0,                                    -- first frame we had coins but no target
+	timeout = 6,                                    -- s a coin may sit unfired before a free release
+	unstick = 3,                                    -- s of "coins exist but none targetable" before self-heal
+	step    = nil,                                  -- one queue iteration; assigned below
+}
+
 local RECLAIM_AFTER = 1.2      -- seconds before an unpaid claim is released
 local QUEUE_CAP     = 128      -- past this we simply do not claim, so nothing is lost
 local FIRE_RANGE    = 60       -- studs: past this, release instead of firing blind
@@ -1993,14 +2037,58 @@ local function dropClaims()
 	reclaims = setmetatable({}, { __mode = "k" })
 	blocked = setmetatable({}, { __mode = "k" })
 	claimQueue, claimHead, claimTail = {}, 1, 0
+	Drain.fired  = setmetatable({}, { __mode = "k" })
+	Drain.queued = setmetatable({}, { __mode = "k" })
+	Drain.stuck  = 0               -- a fresh start is not a stuck one
 	holdUntil = 0                  -- never resume a stop that belongs to an old run
 	targetInst = nil               -- and never hold a reference to an old coin
 end
 
+-- A coin already waiting its turn must NOT be pushed again. The old version could
+-- queue the same instance several times over: the reclaim timer released it while it
+-- was still in the queue, targeting picked it straight back up, and every duplicate
+-- costs the worker a whole frame it could have spent on a coin nobody has touched yet.
 local function pushClaim(inst, now)
+	if Drain.queued[inst] then return end
+	Drain.queued[inst] = true
 	claimed[inst] = now
 	claimTail = claimTail + 1
 	claimQueue[claimTail] = inst    -- indices only; table.remove would be O(n)
+end
+
+-- ONE iteration of the queue, lifted out of the loop so the loop can pcall it. It
+-- lives on Drain rather than in a local because the file is near Luau's ceiling.
+Drain.step = function()
+	if claimHead > claimTail then
+		task.wait(0.03)                       -- queue empty: idle cheaply
+		return
+	end
+	local inst = claimQueue[claimHead]
+	claimQueue[claimHead] = nil
+	claimHead = claimHead + 1
+	if inst == nil then return end            -- dropClaims() swapped the queue mid-flight
+	Drain.queued[inst] = nil                  -- out of the queue: it may be re-pushed again
+	local hrp = myRoot()
+	local part = alive(inst) and partOf(inst) or nil
+	if hrp and alive(part) and sanePos(part.Position) then
+		-- The touch used to fire from ~0 studs, which is the distance we
+		-- know the server accepts. Pacing means we can be further off by
+		-- the time a coin's turn comes, so past FIRE_RANGE we release the
+		-- claim instead of firing on a guess: it becomes a target again
+		-- and gets touched from close up on the next pass.
+		if (part.Position - hrp.Position).Magnitude > FIRE_RANGE then
+			claimed[inst] = nil
+		else
+			-- stamped BEFORE the touch, so the reclaim clock cannot start early: this
+			-- is the moment the coin has had its chance, whatever forceTouch does next
+			Drain.fired[inst] = os.clock()
+			local ok, err = pcall(forceTouch, hrp, inst, part)
+			if not ok then coinWarn(err) end
+			task.wait()                       -- one frame, so a burst still paces
+		end
+	else
+		claimed[inst] = nil                   -- gone or unreachable: do not hold the claim
+	end
 end
 
 -- The worker only fires touches; the DRIVER owns the timing now (see holdUntil
@@ -2009,33 +2097,22 @@ end
 -- queue would fall a whole delay behind the character on every pickup. It exits
 -- on its own when autoCoins clears or its generation is superseded, which is why
 -- it needs no Bin entry beyond the flag hooks below.
+--
+-- EVERY ITERATION IS NOW pcall'd, and every iteration stamps Drain.stamp. That is
+-- the fix for the reported stuck: a throw no longer ends the worker, and if it dies
+-- or wedges anyway the watchdog in the driver notices the stale stamp and restarts
+-- it. A silent worker used to be indistinguishable from a quiet queue.
 local function startDrain()
 	driveGen = driveGen + 1
 	local gen = driveGen
+	Drain.stamp = os.clock()          -- claim the watchdog window before we yield
 	task.spawn(function()
 		while autoCoins and gen == driveGen do
-			if claimHead > claimTail then
-				task.wait(0.03)                       -- queue empty: idle cheaply
-			else
-				local inst = claimQueue[claimHead]
-				claimQueue[claimHead] = nil
-				claimHead = claimHead + 1
-				local hrp = myRoot()
-				local part = alive(inst) and partOf(inst) or nil
-				if hrp and alive(part) and sanePos(part.Position) then
-					-- The touch used to fire from ~0 studs, which is the distance we
-					-- know the server accepts. Pacing means we can be further off by
-					-- the time a coin's turn comes, so past FIRE_RANGE we release the
-					-- claim instead of firing on a guess: it becomes a target again
-					-- and gets touched from close up on the next pass.
-					if (part.Position - hrp.Position).Magnitude > FIRE_RANGE then
-						claimed[inst] = nil
-					else
-						local ok, err = pcall(forceTouch, hrp, inst, part)
-						if not ok then coinWarn(err) end
-						task.wait()                   -- one frame, so a burst still paces
-					end
-				end
+			Drain.stamp = os.clock()
+			local ok, err = pcall(Drain.step)
+			if not ok then
+				coinWarn("drain: " .. tostring(err))
+				task.wait(0.05)       -- a throwing step must not become a busy loop
 			end
 		end
 	end)
@@ -2143,20 +2220,36 @@ local function coinFrame(dt)
 		-- position is not a real coordinate is not a place we will fly to.
 		if alive(part) and sanePos(part.Position) then
 			local at = claimed[inst]
-			if at and (now - at) > RECLAIM_AFTER then
-				-- the touch did not pay off; put it back in play
-				claimed[inst] = nil
-				at = nil
-				-- ...but not forever. Something that sits in a CoinContainer and
-				-- never responds to a touch (map furniture, a coin the server has
-				-- already banked) would otherwise be re-targeted every second for
-				-- the rest of the round, which reads exactly like "it still tweens
-				-- when there are no coins". Three refusals and it goes on the bench.
-				local n = (reclaims[inst] or 0) + 1
-				reclaims[inst] = n
-				if n >= GIVE_UP_AFTER then
-					blocked[inst] = now
-					if inst == targetInst then targetInst = nil end
+			-- THE RECLAIM CLOCK STARTS AT THE TOUCH, NOT AT THE CLAIM. `at` is when the
+			-- coin joined the queue; Drain.fired[inst] is when its touch actually went
+			-- out. Judging a coin by `at` punished it for the queue being long -- at
+			-- QUEUE_CAP the drain takes longer than RECLAIM_AFTER, so a perfectly good
+			-- coin could collect three "refusals" without ever having been touched, and
+			-- three refusals is the bench.
+			if at then
+				local shot = Drain.fired[inst]
+				if shot and (now - shot) > RECLAIM_AFTER then
+					-- the touch did not pay off; put it back in play
+					claimed[inst] = nil
+					at = nil
+					-- ...but not forever. Something that sits in a CoinContainer and
+					-- never responds to a touch (map furniture, a coin the server has
+					-- already banked) would otherwise be re-targeted every second for
+					-- the rest of the round, which reads exactly like "it still tweens
+					-- when there are no coins". Three refusals and it goes on the bench.
+					local n = (reclaims[inst] or 0) + 1
+					reclaims[inst] = n
+					if n >= GIVE_UP_AFTER then
+						blocked[inst] = now
+						if inst == targetInst then targetInst = nil end
+					end
+				elseif not shot and (now - at) > Drain.timeout then
+					-- Queued for six seconds and never fired: the worker is gone, or the
+					-- backlog is hopeless. Release it with NO penalty -- it has done
+					-- nothing wrong, and benching it here is precisely how the whole
+					-- pool used to go dark. The watchdog deals with the worker.
+					claimed[inst], Drain.queued[inst] = nil, nil
+					at = nil
 				end
 			end
 			local bench = blocked[inst]
@@ -2204,6 +2297,7 @@ local function coinFrame(dt)
 	end
 
 	if tgtPart then
+		Drain.stuck = 0
 		glideToward(hrp, tgtPart.Position, dt)
 	else
 		-- the target was collected, destroyed, or dropped out of the pool. This
@@ -2211,8 +2305,23 @@ local function coinFrame(dt)
 		-- reference to a destroyed Instance is exactly the leak we don't allow.
 		targetInst = best
 		if best then
+			Drain.stuck = 0
 			glideToward(hrp, bestPart.Position, dt)
 		else
+			-- NOTHING TARGETABLE, BUT THE POOL IS NOT EMPTY -- the #pool == 0 case
+			-- returned long before this. So there ARE coins and every one of them is
+			-- claimed or benched, and that is the exact state the user was fixing by
+			-- hand with the toggle. Give it Drain.unstick seconds to resolve on its
+			-- own (a claim releasing is normal and takes about a second), then do what
+			-- the toggle did: swap the bench, the claims and the queue for fresh
+			-- tables. THIS is the self-heal -- off/on should never be necessary again.
+			if Drain.stuck == 0 then
+				Drain.stuck = now
+			elseif (now - Drain.stuck) > Drain.unstick then
+				coinWarn(#pool .. " coins in range and none targetable for "
+					.. Drain.unstick .. "s -- clearing the bench and the claims")
+				dropClaims()                  -- also resets Drain.stuck
+			end
 			-- NOTHING DETECTED INSIDE COIN_RADIUS (150 studs): stop the character
 			-- and wait right here. It stays put until a coin spawns in range, then
 			-- flies off again on that frame.
@@ -2231,6 +2340,15 @@ local function setCollecting(on)
 		startDrain()
 		driveConn = Bin.conn(RunService.Heartbeat:Connect(function(dt)
 			if not autoCoins then return end
+			-- THE WATCHDOG. The worker stamps every iteration, so a stamp older than two
+			-- seconds means it is dead or wedged -- and a dead worker used to look
+			-- exactly like a quiet queue, which is what made the stuck unfixable from
+			-- the inside. startDrain() bumps driveGen, so any zombie exits on its next
+			-- loop check and we never accumulate workers.
+			if (os.clock() - Drain.stamp) > 2 then
+				coinWarn("drain worker stopped responding -- restarting it")
+				startDrain()
+			end
 			-- never swallow the throw: a silent collector is unfixable
 			local ok, err = pcall(coinFrame, dt)
 			if not ok then coinWarn(err) end
@@ -2571,10 +2689,10 @@ Bin.onUnload(function() autoShells = false end)
 --==============================================================
 -- COMBAT TAB   (placeholder)
 --==============================================================
--- Sits above Performance on purpose -- the tab order was asked for as Config, Farm,
--- Combat, Performance, and addTab() takes its LayoutOrder from #tabs, so creation
--- order IS sidebar order. Moving a tab means moving its addTab() call, nothing else.
-comingSoon(addTab("Combat"),
+-- The number is the sidebar slot (see addTab). Tab order is asked for as Config,
+-- Farm, Combat, ESP, Misc, Performance -- and because the order is a number rather
+-- than file position, Performance can stay exactly where it is at slot 6.
+comingSoon(addTab("Combat", 3),
 	"Kill aura and gun mods are not built yet. This tab is a placeholder. Murderer"
 	.. " tracking lives in the ESP tab.")
 
@@ -2626,7 +2744,7 @@ comingSoon(addTab("Combat"),
 -- "invalid key to 'next'".
 --==============================================================
 ;(function()
-	local Perf = addTab("Performance")
+	local Perf = addTab("Performance", 6)
 
 	-- declared in here, not at the top of the file: the main chunk is at its local
 	-- register ceiling and a function body is its own frame (see the ESP note below)
@@ -3082,7 +3200,7 @@ end)()
 -- calling comingSoon's RESULT. Do not delete it.
 --==============================================================
 ;(function()
-	local ESP = addTab("ESP")
+	local ESP = addTab("ESP", 4)
 
 	----------------------------------------------------------------
 	-- drawing surface
@@ -3778,6 +3896,539 @@ end)()
 	objects:Label("The dropped gun is a name guess, not a confirmed path -- the round"
 		.. " the dump watched ended on the clock, so no gun was ever dropped to look"
 		.. " at. If it never marks anything, that is why.")
+end)()
+
+--==============================================================
+-- MISC TAB   (Anti AFK)
+--==============================================================
+-- Slot 5, between ESP and Performance (see addTab).
+--
+-- WHAT THE 20-MINUTE KICK ACTUALLY IS
+-- Roblox itself disconnects a client that sends no input for ~20 minutes. It is not a
+-- MM2 rule and there is no remote to spoof: the client fires LocalPlayer.Idled at the
+-- warning point and the disconnect follows. So the fix is to make one real input event
+-- happen when that fires, and VirtualUser is the only thing that produces input the
+-- engine counts as input. A CFrame write, a GUI tween, a mouse move we simulate any
+-- other way -- none of them reset the idle clock.
+--
+-- WHY ClickButton2 AND NOT ClickButton1
+-- Button2 is right-click. In MM2 left-click swings the knife and fires the gun, so
+-- ClickButton1 would be a real attack fired at a random moment while the user is away --
+-- as murderer that is a free reveal and as sheriff it is a wasted bullet. Right-click
+-- is bound to nothing in this game, so it resets the clock and does nothing else.
+-- CaptureController() first, or the click has no controller to go to.
+--
+-- WHY THERE IS NO TIMER LOOP
+-- The obvious alternative is a `while true do click; task.wait(60) end`, and it is
+-- worse in every way: it presses a button 20 times an hour while the user is actively
+-- PLAYING, for no benefit, because the idle clock was already being reset by their own
+-- input. Idled fires exactly when -- and only when -- the press is needed.
+;(function()
+	local Misc = addTab("Misc", 5)
+
+	local sec = Misc:Section("Anti AFK")
+	sec.card.LayoutOrder = 1
+
+	-- Not a top-level local: the file is near Luau's ceiling, and a service that is
+	-- only used inside this block has no business in the main chunk.
+	local VU = nil
+	local ok = pcall(function() VU = game:GetService("VirtualUser") end)
+	if not ok then VU = nil end
+
+	local antiAfk = false
+
+	-- The connection is made ONCE and gated on the flag, rather than connected and
+	-- disconnected with the toggle. Idled fires at most three times an hour, so there
+	-- is nothing to save by disconnecting, and a flag cannot leak a second connection
+	-- if the toggle is flipped quickly -- which the connect/disconnect version can.
+	Bin.conn(LocalPlayer.Idled:Connect(function()
+		if not antiAfk or not VU then return end
+		local fired = pcall(function()
+			VU:CaptureController()
+			VU:ClickButton2(Vector2.new())
+		end)
+		if fired then
+			print("[Arjhay Hub] anti afk: idle warning answered with a right-click")
+		else
+			warn("[Arjhay Hub] anti afk: VirtualUser refused the click."
+				.. " Your executor does not allow it -- the kick will still happen.")
+		end
+	end))
+
+	Cfg.add("misc.antiafk", "toggle",
+	sec:Toggle("Anti AFK", false, function(v)
+		antiAfk = v
+		if v and not VU then
+			warn("[Arjhay Hub] anti afk: VirtualUser is not available in this"
+				.. " executor, so this toggle cannot do anything.")
+		end
+	end))
+
+	sec:Label("Answers Roblox's own 20-minute idle disconnect with a single"
+		.. " right-click, which is bound to nothing in this game -- so it never swings"
+		.. " your knife or fires your gun. It fires only when the idle warning"
+		.. " actually arrives, not on a timer, so it does nothing at all while you are"
+		.. " playing.")
+
+	if not VU then
+		sec:Label("Heads up: VirtualUser is blocked in this executor, so the toggle is"
+			.. " inert here. Nothing else in the hub is affected.")
+	end
+
+	-- antiAfk is a plain flag with no loop and no second connection, so there is
+	-- nothing for Bin.flush() to miss -- but the flag itself outlives a reload of the
+	-- script if it were ever hoisted, so clear it for the same reason the other
+	-- features clear theirs.
+	Bin.onUnload(function() antiAfk = false end)
+end)()
+
+--==============================================================
+-- AUTO PICK MAP   (Farm tab)
+--==============================================================
+-- WHAT THE DUMP SETTLED  (MM2 MapVote.lua, run 2026-08-22)
+-- The three choices are INVISIBLE trigger volumes, not the beige squares you see:
+--     Workspace.Lobby.VotePads.VotePad3.Pad   x3
+--     6.8 x 6.8 x 5.0, CanCollide=false, CanTouch=true, Anchored, Transparency=1
+--     Workplace (-10.2,-64.8,-95.0)  Bio Lab (9.8,-64.8,-95.0)  Hospital 3 (-0.2,-64.8,-96.3)
+-- The beige slab under each one is Lobby.Lobby.Pad_Bottom.Pad.Block, which is art.
+-- So this block hunts the volume BY NAME inside the vote container, and never by
+-- shape: the dump's shape finder matched 285 things in the lobby, including every
+-- roof, path, carpet and one starfish, while name+ancestry was a clean 3 for 3.
+--
+-- THERE IS NO VOTE REMOTE.
+-- 169 remotes were enumerated and not one is vote-named. A 45-second spy on
+-- FireServer/InvokeServer caught exactly one call in the whole window -- Remotes
+-- .Extras.GetChance, unrelated -- while the user stepped on and off all three pads
+-- and the counters visibly moved. That is the same shape as this game's coin pickup:
+-- the .Touched lives on the SERVER, there is nothing to spoof, and the only thing
+-- that votes is the character being in the box.
+--
+-- IT IS OCCUPANCY, NOT A ONE-SHOT.
+-- The log reads "Votes: 0" -> "Votes: 1" on step-on and 1 -> 0 on step-off, and the
+-- count MOVES from the old map to the new one as you walk between pads. So a vote is
+-- HELD rather than banked, and voting a second time is a change of mind, not a
+-- second vote -- which is why one send per stage is the whole job.
+--
+-- WHY IT TAPS FIRST, AND WHY IT NEVER LETS GO
+-- Every pad reported "TouchTransmitter: absent" and "client .Touched connections: 0",
+-- which is exactly the state in which firetouchinterest has NOTHING to fire: the
+-- touch interest is created by a connection, and there is no connection. So we make
+-- one ourselves -- and then KEEP it, because a vote here is held, not banked.
+--
+-- THE BUG THE FIRST BUILD SHIPPED, FROM THE USER'S OWN CONSOLE
+-- v1 fired 0 and then 1: touch, then untouch. For an occupancy trigger that is
+-- stepping onto the pad and immediately stepping off it, and this file's own header
+-- already said so two paragraphs up. The vote landed and was withdrawn inside a
+-- single frame, the counter was back to zero 0.8s later when it was read, and every
+-- attempt reported "the touch did not register" -- eight of them in the user's log,
+-- across four different maps, once every twelve seconds. Nothing was broken about
+-- the touch. We were cancelling it ourselves. Only the BEGIN is sent now, the
+-- connection carrying it is held until the stage turns over, and dropHold() is the
+-- one place allowed to end a vote.
+--
+-- WHY IT VERIFIES, AND ONLY THEN WALKS
+-- The dump was built to answer "does firetouchinterest vote without walking" and it
+-- FAILED to. Its synthetic-touch phase built the candidate list during the lobby
+-- stage; the round then started mid-run and teleported the character onto the loaded
+-- map, so by the time it fired, the nearest cached "pad" was a decoration block 8917
+-- studs away. It touched that, saw no counter move, and reported a negative. It was
+-- not a negative, it was a void test. So nothing here assumes either answer: it
+-- fires, reads the counter on the pad it aimed at, and moves the character only if
+-- the counter did not move. If the touch works you never see yourself budge; if it
+-- does not, the vote still lands.
+--
+-- RANGE: THE TOUCH HAS NONE, THE WALK DOES
+-- v1 gated both on 400 studs and called that the stage detector. It was asked for the
+-- other way round -- "it should vote even im not near it" -- and the gate was wrong
+-- anyway: firing a touch interest does not care where you are standing, so a range
+-- limit on it only forbids the one thing that makes this feature worth having. What a
+-- range limit IS good for is the fallback, because a 9000-stud walk is not a
+-- fallback, so WALK_RANGE now fences only that. And since the 8917-stud reading was
+-- what proved a long distance means "a round is running, not a vote stage", that is
+-- what it gets used for now: an explanation in the one warning, rather than a veto.
+--
+-- SAY IT ONCE
+-- The retry is one cheap call every COOLDOWN seconds and worth keeping, but v1 warned
+-- on every single one of them. Twelve identical lines a minute is how the useful line
+-- gets buried, so the complaint is latched per stage alongside the vote itself.
+--
+-- RE-ARMING, WITH NOTHING THAT CAN RENEW ITSELF
+-- The Auto Pick Device storm was a debounce keyed on the instance that the press
+-- rebuilt, so the latch here is never keyed on a pad. It is set BEFORE the send, and
+-- three independent things clear it: the pads being gone for a beat, a new character
+-- (a round boundary you get for free), and every board reading zero votes -- our vote
+-- is gone, so the stage reset. Under all three sits COOLDOWN, a plain wall-clock
+-- floor that nothing in this block can push forward.
+--==============================================================
+;(function()
+	local Vote = {
+		on    = false,  -- the toggle
+		walk  = true,   -- may we move the character when the touch does not take
+		voted = false,  -- latch, set before anything is sent
+		at    = 0,      -- os.clock() of the last send: the floor nothing renews
+		gone  = 0,      -- when the pads first went missing
+		hunt  = 0,      -- last deep search, so a missing container is not a scan
+		root  = nil,    -- cached VotePads container
+		busy  = false,  -- a send is in flight
+		spin  = false,  -- the poll loop is already running
+		tap   = nil,    -- the .Touched connection that HOLDS the current vote
+		said  = false,  -- have we already complained about this stage
+	}
+
+	local COOLDOWN   = 12    -- seconds between two sends, whatever else happens
+	local GONE_FOR   = 1.5   -- pads must stay missing this long to re-arm
+	-- The touch has NO range limit, by request: "it should vote even im not near it".
+	-- Only the WALK is fenced, because a 9000-stud walk is not a fallback.
+	local WALK_RANGE = 400
+	local ARRIVE     = 3     -- studs: close enough to be standing on it
+	local STEP       = 4     -- studs per frame while walking
+	local WALK_MAX   = 4     -- seconds before the walk gives up
+	local SETTLE     = 0.8   -- the counter moved ~0.4s after each step-on; double it
+	local POLL       = 1
+
+	-- Letting go of the held touch. The connection is what keeps the occupancy alive,
+	-- so this is the only thing in here allowed to end a vote, and it runs when the
+	-- stage turns over or the hub unloads -- never right after firing.
+	local function dropHold()
+		if Vote.tap then
+			pcall(function() Vote.tap:Disconnect() end)
+			Vote.tap = nil
+		end
+	end
+
+	local sec = Farm:Section("Auto Pick Map")
+	-- Coins and Shells are both on 0, so 1 puts this last and moves neither of them.
+	sec.card.LayoutOrder = 1
+
+	-- WHY THE CONTAINER IS FOUND RATHER THAN HARDCODED
+	-- workspace.Lobby.VotePads is where the dump found it and it is tried first
+	-- because it costs two lookups. The recursive fallback exists because the dump
+	-- could not tell whether the three pads sit in ONE model named VotePad3 or in
+	-- three sibling models that all share that name -- GetFullName() prints the same
+	-- string either way -- so nothing below ever names a middle layer. It is also
+	-- rate limited, because a recursive FindFirstChild that MISSES walks the whole of
+	-- workspace, and during a round it would miss on every single poll.
+	local function padRoot()
+		if Vote.root and alive(Vote.root) then return Vote.root end
+		Vote.root = nil
+		local lobby = workspace:FindFirstChild("Lobby")
+		local box = lobby and lobby:FindFirstChild("VotePads")
+		if not box then
+			local now = os.clock()
+			if now - Vote.hunt < 5 then return nil end
+			Vote.hunt = now
+			box = workspace:FindFirstChild("VotePads", true)
+		end
+		Vote.root = box
+		return box
+	end
+
+	-- The loose fallback is deliberate, and it is the opposite call from Auto Pick
+	-- Device: there a wrong press costs a rejoin, so it would rather do nothing. Here
+	-- the search is already fenced inside the vote container -- no coin, floor or
+	-- player is in it to hit by mistake -- and the worst a wrong part can cost is a
+	-- different map. So if the name ever changes, take any touchable part of roughly
+	-- pad size rather than silently doing nothing at all.
+	local function padsOf(box)
+		local out, n = {}, 0
+		for _, d in ipairs(box:GetDescendants()) do
+			if n >= 12 then break end
+			if d:IsA("BasePart") and d.Name == "Pad" then
+				n = n + 1
+				out[n] = d
+			end
+		end
+		if n > 0 then return out, n end
+		for _, d in ipairs(box:GetDescendants()) do
+			if n >= 12 then break end
+			if d:IsA("BasePart") and d.CanTouch then
+				local s = d.Size
+				if s.X >= 3 and s.X <= 20 and s.Z >= 3 and s.Z <= 20 then
+					n = n + 1
+					out[n] = d
+				end
+			end
+		end
+		return out, n
+	end
+
+	-- The MapName and Votes labels are NOT children of the pad they describe. They sit
+	-- on SurfaceGuis parented to the vote model but ADORNED to Lobby.Lobby
+	-- .Map_Display.Screen, so the only thing tying a board to a pad is where it is in
+	-- the world: 4.6 studs for all three in the dump, and 25 is the cap.
+	local function boardFor(box, pad)
+		local best, bestD = nil, 25
+		for _, d in ipairs(box:GetDescendants()) do
+			if d:IsA("SurfaceGui") or d:IsA("BillboardGui") then
+				local holder = d:FindFirstChild("Container") or d
+				local at = d.Adornee
+				if holder:FindFirstChild("MapName") and at and at:IsA("BasePart") then
+					local dist = (at.Position - pad.Position).Magnitude
+					if dist < bestD then best, bestD = holder, dist end
+				end
+			end
+		end
+		return best
+	end
+
+	local function textOf(holder, child)
+		if not holder then return nil end
+		local lab = holder:FindFirstChild(child)
+		if lab and lab:IsA("TextLabel") then return lab.Text end
+		return nil
+	end
+
+	-- "Votes: 3" -> 3, and nil when there is no readable board. nil rather than 0 on
+	-- purpose: "unreadable" and "nobody has voted" must not be the same answer,
+	-- because the re-arm below reads all-zero as a fresh stage and would spin.
+	local function countOf(holder)
+		local t = textOf(holder, "Votes")
+		if not t then return nil end
+		return tonumber(t:match("(%d+)%s*$"))
+	end
+
+	-- WHY THE RELEASE IS NEVER SENT, AND WHY THE CONNECTION IS KEPT
+	-- v1 fired 0 and then 1, which is a touch AND an untouch. This block's own header
+	-- says a vote is OCCUPANCY, and the dump's log proves it -- 0 -> 1 on step-on,
+	-- 1 -> 0 on step-off -- so firing both is literally stepping on the pad and
+	-- immediately stepping off it. The vote landed and was withdrawn inside one frame,
+	-- the counter was back to zero by the time it was read, and every attempt reported
+	-- "the touch did not register" when what actually happened was a successful touch
+	-- followed by a successful cancel. So only the BEGIN is ever sent now, and the
+	-- touch interest carrying it is kept alive for the rest of the stage: dropping the
+	-- connection is one of the ways an occupancy trigger can decide you left.
+	--
+	-- Both argument orders are tried because executors disagree about which part the
+	-- interest has to belong to, and a second begin on a touch that has already begun
+	-- is a no-op -- unlike a release, which is the thing we are no longer sending.
+	local function hold(pad)
+		local hrp = myRoot()
+		if not hrp or typeof(FTI) ~= "function" then return false end
+		dropHold()
+		pcall(function() Vote.tap = Bin.conn(pad.Touched:Connect(function() end)) end)
+		pcall(function() FTI(hrp, pad, 0) end)
+		pcall(function() FTI(pad, hrp, 0) end)
+		return true
+	end
+
+	local function walkTo(pad)
+		local t0 = os.clock()
+		while Vote.on and Vote.walk and alive(pad) do
+			if os.clock() - t0 > WALK_MAX then return false end
+			local hrp, char = myRoot()
+			if not hrp then return false end
+			local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+			if hum and hum.Health <= 0 then return false end  -- a corpse does not vote
+			local here, goal = hrp.Position, pad.Position
+			local away = goal - here
+			local d = away.Magnitude
+			if d <= ARRIVE then return true end
+			if d > WALK_RANGE then return false end
+			-- Stepped, not teleported, and clamped: this game's "Invalid position" kick
+			-- is entirely server side, so the only defence is never sending a position
+			-- worth refusing. sanePos is the same NaN/out-of-world guard the coin
+			-- collector flies behind.
+			local dest = here + away.Unit * math.min(STEP, d)
+			if not sanePos(dest) then return false end
+			hrp.CFrame = CFrame.new(dest) * hrp.CFrame.Rotation
+			RunService.Heartbeat:Wait()
+		end
+		return false
+	end
+
+	local function cast()
+		local box = padRoot()
+		if not box then return "no pads" end
+		local pads, n = padsOf(box)
+		if n == 0 then return "no pads" end
+		local hrp = myRoot()
+		if not hrp then return "no character" end
+
+		local pick, pickD = nil, math.huge
+		for i = 1, n do
+			local p = pads[i]
+			if alive(p) then
+				local d = (p.Position - hrp.Position).Magnitude
+				if d < pickD then pick, pickD = p, d end
+			end
+		end
+		if not pick then return "no pads" end
+		-- Nearest, because the user asked for "just pick any map" and of the ways to
+		-- pick any, the closest is the one that also makes the walk fallback shortest.
+		-- Deliberately NOT range-gated: the whole point of firing a touch is that it
+		-- works from where you are standing.
+
+		local board = boardFor(box, pick)
+		local name  = textOf(board, "MapName") or pick:GetFullName()
+		local was   = countOf(board)
+
+		hold(pick)
+		task.wait(SETTLE)
+
+		-- One honest limit: if another player's vote lands inside this window the
+		-- counter moves for their reason and we skip the walk for nothing. It costs
+		-- this round's vote and nothing else, and there is no per-player signal
+		-- anywhere in the dump to tell the two apart.
+		local after = countOf(board)
+		if was and after and after > was then
+			print("[Arjhay Hub] map vote: " .. name .. " -- touched, no movement needed")
+			return "voted"
+		end
+
+		-- An unreadable counter is a different failure from a touch that missed, and
+		-- saying "the touch did not register" for it sends you hunting the wrong bug.
+		local why = (was == nil or after == nil)
+			and ("could not read the vote counter on " .. name
+				.. " (the board is there but its Votes label is not), so whether the"
+				.. " touch worked is unknown")
+			or ("the touch did not register on " .. name .. " (counter still reads "
+				.. tostring(after) .. ")")
+
+		if not Vote.walk then
+			-- Once per stage, not once per retry. The retry itself is one cheap call
+			-- every COOLDOWN seconds and worth keeping; twelve identical warnings a
+			-- minute are not, and they buried the useful line in the user's console.
+			if not Vote.said then
+				Vote.said = true
+				warn("[Arjhay Hub] map vote: " .. why .. ", and Walk To Pad is off, so"
+					.. " nothing else was tried. If this never succeeds, this game"
+					.. " wants the character physically in the pad.")
+			end
+			return "touch failed"
+		end
+		if pickD > WALK_RANGE then
+			if not Vote.said then
+				Vote.said = true
+				warn("[Arjhay Hub] map vote: " .. why .. ", and the pad is "
+					.. math.floor(pickD) .. " studs away -- too far to walk, so this is"
+					.. " almost certainly a round in progress rather than a vote stage.")
+			end
+			return "out of range"
+		end
+		if not walkTo(pick) then
+			warn("[Arjhay Hub] map vote: could not reach " .. name .. ".")
+			return "unreachable"
+		end
+		task.wait(SETTLE)
+		local now = countOf(board)
+		if was and now and now > was then
+			print("[Arjhay Hub] map vote: " .. name .. " -- walked onto the pad")
+		else
+			-- Standing in the box IS the vote, so this is a report, not a failure.
+			print("[Arjhay Hub] map vote: standing on " .. name
+				.. ", which is how this game counts a vote. Counter reads "
+				.. (now == nil and "unreadable" or tostring(now)) .. ".")
+		end
+		return "voted"
+	end
+
+	local function allZero(box, pads, n)
+		local read = false
+		for i = 1, n do
+			local c = countOf(boardFor(box, pads[i]))
+			if c == nil then return false end  -- unreadable is not zero
+			if c > 0 then return false end
+			read = true
+		end
+		return read
+	end
+
+	-- Re-arming in one place, so the held touch cannot be forgotten on any of the three
+	-- paths that end a stage. Letting go here is the point: while Vote.tap is alive the
+	-- server may still count us as standing on last stage's pad.
+	local function rearm()
+		dropHold()
+		Vote.voted, Vote.said = false, false
+	end
+
+	local function tick()
+		local box = padRoot()
+		local pads, n = nil, 0
+		if box then pads, n = padsOf(box) end
+
+		if n == 0 then
+			if Vote.gone == 0 then Vote.gone = os.clock() end
+			if Vote.voted and os.clock() - Vote.gone >= GONE_FOR then
+				rearm()
+			end
+			return
+		end
+		Vote.gone = 0
+
+		if Vote.voted then
+			if allZero(box, pads, n) then rearm() end
+			return
+		end
+		if Vote.busy or os.clock() - Vote.at < COOLDOWN then return end
+
+		-- LATCH FIRST, and stamp the clock first. Setting either of these after the
+		-- send leaves a window in which a yield lets the next poll send a second vote,
+		-- which is the exact shape of the click storm that froze the user's phone.
+		Vote.voted, Vote.busy, Vote.at = true, true, os.clock()
+		task.spawn(function()
+			local ok, res = pcall(cast)
+			Vote.busy = false
+			if not ok then
+				warn("[Arjhay Hub] map vote: " .. tostring(res))
+			elseif res ~= "voted" then
+				-- Nothing was sent, so hand the latch back. Vote.at has already moved,
+				-- so the retry still cannot arrive sooner than the cooldown.
+				Vote.voted = false
+			end
+		end)
+	end
+
+	local function loop()
+		if Vote.spin then return end
+		Vote.spin = true
+		while Vote.on do
+			-- One throw must not kill the worker: a dead loop looks exactly like a
+			-- quiet one, which is what made Auto Collect Coins "stick" until it was
+			-- toggled off and on again.
+			local ok, err = pcall(tick)
+			if not ok then warn("[Arjhay Hub] map vote: " .. tostring(err)) end
+			task.wait(POLL)
+		end
+		Vote.spin = false
+	end
+
+	-- A new character is a round boundary for free: MM2 respawns you when a round
+	-- starts and again when it ends, and unlike a remote name it cannot be a guess.
+	-- It goes through rearm() rather than setting the flag, so the held touch on the
+	-- old character's pad is let go with it -- that character no longer exists.
+	Bin.conn(LocalPlayer.CharacterAdded:Connect(rearm))
+
+	Cfg.add("farm.pickmap.enabled", "toggle",
+	sec:Toggle("Auto Pick Map", false, function(on)
+		Vote.on = on
+		if on then
+			Vote.gone = 0
+			rearm()
+			task.spawn(loop)
+		else
+			dropHold()
+		end
+	end))
+
+	Cfg.add("farm.pickmap.walk", "toggle",
+	sec:Toggle("Walk To Pad If Needed", true, function(v) Vote.walk = v end))
+
+	sec:Label("Votes for whichever map pad is nearest, once per vote stage. The pads"
+		.. " are invisible boxes sitting over the beige squares, and this game has no"
+		.. " vote remote at all -- the only thing that counts is your character being"
+		.. " in one -- so it holds a touch on the pad from wherever you are standing,"
+		.. " at any distance. Walking is only the fallback for when that does not take,"
+		.. " and it is the one part with a range limit.")
+
+	-- The poll is a while-loop, so Bin.flush() cannot reach it: clear the flag it
+	-- spins on. Vote.walk is cleared too, which is what stops a walk already in
+	-- flight, the held touch is let go, and the cached container is dropped so
+	-- unloading does not keep an Instance alive.
+	Bin.onUnload(function()
+		Vote.on, Vote.walk, Vote.voted = false, false, false
+		dropHold()
+		Vote.root = nil
+	end)
 end)()
 
 --==============================================================
