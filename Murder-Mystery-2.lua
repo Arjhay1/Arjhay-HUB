@@ -1771,11 +1771,11 @@ local Farm = addTab("Farm", 2)
 --------------------------------------------------------------------
 local coinSec = Farm:Section("Auto Collect Coins")
 
-local COIN_RADIUS = 150            -- fixed by request; the slider is gone
+local COIN_RADIUS = 250            -- fixed by request; the slider is gone
 local COIN_TOUCH  = 10             -- studs: close enough to grab in passing
 local COIN_STOP   = 2              -- studs: close enough to count as ARRIVED
 local coinCats    = { Coins = true }
-local coinSpeed   = 60
+local coinSpeed   = 30
 local coinDelay   = 1              -- the deliberate stop at each coin
 local autoCoins   = false
 
@@ -1914,6 +1914,15 @@ end)
 -- The server owns the coin's .Touched (see CONTAINER_NAMES note), and the touch
 -- interest can sit on the pickup part OR on one of the visual parts welded to it,
 -- so fire against all of them. Capped: a coin is 3 parts, not 300.
+
+-- HOW LONG THE TOUCH IS HELD, and this line is the whole bug. The release used to be
+-- a bare `task.wait()` -- ONE FRAME, about 16ms -- when a round trip to the server is
+-- 50 to 150ms. So the release could leave this client before the press had arrived,
+-- and the server saw a press and a release together, or nothing worth acting on. That
+-- is EXACTLY the bug that made every map vote cancel itself (see the Auto Pick Map
+-- block near the end of this file, where the fix was to stop releasing at all), and it
+-- was sitting here too -- which is why a measured test refused a coin 7.2 studs away.
+local HOLD_TOUCH = 0.4
 local function forceTouch(hrp, inst, part)
 	local hit = false
 	if typeof(FTI) == "function" then
@@ -1926,12 +1935,36 @@ local function forceTouch(hrp, inst, part)
 			end
 		end
 		for _, t in ipairs(targets) do
+			-- BOTH ARGUMENT ORDERS. Executors disagree on which part comes first, and
+			-- with the wrong order firetouchinterest quietly does nothing while the
+			-- pcall still returns true. The vote pads fire both orders and work; this
+			-- fired one and did not. Firing both is never wrong: the spurious call has
+			-- no interest to fire and is a no-op.
+			--
+			-- And `hit` below is DEAD, which is half of why this survived so long. The
+			-- caller is `pcall(forceTouch, ...)`, so the return value lands in the slot
+			-- reserved for an error message and is only ever read when the call failed
+			-- -- i.e. never. Nothing in this file has ever checked whether a touch
+			-- registered; the only feedback loop is the reclaim clock noticing, a second
+			-- later, that the coin is still there. Left in place rather than removed
+			-- because Drain.step's signature is not worth churning for it, but do not
+			-- mistake it for a check.
 			if pcall(function() FTI(hrp, t, 0) end) then hit = true end
+			pcall(function() FTI(t, hrp, 0) end)
 		end
-		task.wait()
-		for _, t in ipairs(targets) do
-			pcall(function() FTI(hrp, t, 1) end)
-		end
+		-- RELEASED FROM A TIMER, NOT INLINE. The hold has to outlast a round trip, but
+		-- the worker cannot afford to sit here for it -- Drain.step paces one coin per
+		-- frame and a 0.4s block would cap the whole collector at about three coins a
+		-- second with a 128-deep queue behind it. So hand the release to the scheduler
+		-- and carry on. No flag guards this closure on purpose: releasing a touch is
+		-- cleanup, and it stays correct after unload. pcall'd because the usual reason
+		-- the coin is gone by now is that the touch worked.
+		task.delay(HOLD_TOUCH, function()
+			for _, t in ipairs(targets) do
+				pcall(function() FTI(hrp, t, 1) end)
+				pcall(function() FTI(t, hrp, 1) end)
+			end
+		end)
 	end
 	local prompt = inst:FindFirstChildWhichIsA("ProximityPrompt", true)
 		or (part.Parent and part.Parent:FindFirstChildWhichIsA("ProximityPrompt"))
@@ -2012,7 +2045,27 @@ local Drain = {
 	stuck   = 0,                                    -- first frame we had coins but no target
 	timeout = 6,                                    -- s a coin may sit unfired before a free release
 	unstick = 3,                                    -- s of "coins exist but none targetable" before self-heal
+	-- PROGRESS, NOT PRESENCE. Drain.stuck only ever noticed "nothing to fly at", so
+	-- every state that keeps a target while never finishing it was invisible to the
+	-- self-heal. These three measure the one thing that actually matters -- are we
+	-- getting closer -- and they are cleared with targetInst so neither pins a coin.
+	aim     = nil,                                  -- the instance these numbers describe
+	near    = 0,                                    -- closest we have been to it
+	gain    = 0,                                    -- clock of the last real improvement
+	nogain  = 4,                                    -- s without gaining a stud before we bench it
 	step    = nil,                                  -- one queue iteration; assigned below
+	-- STALL WATCH. Fields, not four more top-level locals, for the reason above.
+	-- A round that never starts is the one failure this collector cannot work around
+	-- from the inside, so the answer is to leave the server -- see Drain.watch below.
+	seen    = 0,                                    -- clock we last saw a round running; 0 = not armed
+	look    = 0,                                    -- clock of the last stall check (throttle)
+	hop     = false,                                -- latched the instant a hop is committed
+	watch   = nil,                                  -- the stall check; assigned below
+	-- THE SPEED GOVERNOR. Same reasoning: fields, not locals. See glideToward.
+	wrote   = nil,                                  -- the exact position we last handed the engine
+	cap     = math.huge,                            -- studs/s this server has been seen to tolerate
+	bump    = 0,                                    -- clock of the last correction (or teleport)
+	said    = 0,                                    -- clock we last mentioned a change, rate limit
 }
 
 local RECLAIM_AFTER = 1.2      -- seconds before an unpaid claim is released
@@ -2020,7 +2073,23 @@ local QUEUE_CAP     = 128      -- past this we simply do not claim, so nothing i
 local FIRE_RANGE    = 60       -- studs: past this, release instead of firing blind
 local GIVE_UP_AFTER = 3        -- unpaid claims on ONE instance before we stop chasing it
 local BLOCK_FOR     = 20       -- seconds it sits on the bench before it gets another go
+-- MAX_STEP IS A BACKSTOP THAT CANNOT CURRENTLY FIRE, and saying so is more use than
+-- leaving it looking like the defence. The step below is
+-- `coinSpeed * math.min(dt, 1/30)`, so at the slider's maximum of 100 it is
+-- 100/30 = 3.3 studs -- MAX_STEP has never once been the binding term. The dt cap
+-- is what actually absorbs a frame hitch. Leave the ceiling in for the day the
+-- slider's range changes, but do not credit it with anything.
 local MAX_STEP      = 8        -- studs the root may move in a SINGLE frame, any speed
+-- CLIMB_RATE is the one that does bite. See the note in glideToward.
+local CLIMB_RATE    = 18       -- studs/second the root may gain or lose VERTICALLY
+-- One line, two names, because this file is close to Luau's 200-register ceiling.
+local STALL_AFTER, STALL_LOOK = 20 * 60, 5   -- s of no round before hopping; s between checks
+-- The governor's two thresholds, both in studs, measured on the position we get BACK
+-- after writing one. Normal drift between a write and the next frame's read is under a
+-- tenth of a stud (gravity for one frame, with velocity zeroed), so 5 is enormously
+-- generous and still nowhere near a real correction. Anything past TP_JUMP is a
+-- respawn or a round change, not the server arguing with us.
+local DRIFT_TOL, TP_JUMP = 5, 50
 
 -- the status label is gone by request, so a failure has to reach the console or
 -- it reaches nobody. Rate limited: this can be called every frame.
@@ -2040,8 +2109,10 @@ local function dropClaims()
 	Drain.fired  = setmetatable({}, { __mode = "k" })
 	Drain.queued = setmetatable({}, { __mode = "k" })
 	Drain.stuck  = 0               -- a fresh start is not a stuck one
+	Drain.wrote  = nil             -- and never measure this frame against an old write
 	holdUntil = 0                  -- never resume a stop that belongs to an old run
 	targetInst = nil               -- and never hold a reference to an old coin
+	Drain.aim  = nil               -- the progress numbers describe that coin; drop them too
 end
 
 -- A coin already waiting its turn must NOT be pushed again. The old version could
@@ -2122,6 +2193,149 @@ local function stopDrain()
 	driveGen = driveGen + 1        -- any live worker falls out of its loop
 end
 
+--==============================================================
+-- THE STALL WATCH — leave a server that has stopped starting rounds
+--
+-- Reported symptom: after three or four hours in one server the round loop stops.
+-- The lobby never ends, no map ever loads, and the collector sits there doing
+-- exactly what it should with nothing to collect. Nothing on the client can restart
+-- a server-side round loop, so the only fix available to us is to leave.
+--
+-- NO TOGGLE, by request. This is not a feature you turn on; it is a condition of the
+-- collector running at all, the same way the watchdog above is. It only ever looks
+-- while Auto Collect Coins is on, and it can only ever fire once.
+--
+-- WHAT COUNTS AS "A ROUND IS RUNNING". There is still no round-state value in this
+-- game -- 169 remotes enumerated, no stage or timer value worth reading -- so the
+-- signal is the one the collector already trusts everywhere else: a LIVE CoinContainer
+-- WITH CHILDREN. Coins exist during a round and are destroyed with the map, so
+-- children in a live container is a round, and no container at all is the lobby.
+--
+-- Both halves of that test are load-bearing. `alive()` rather than `.Parent ~= nil`,
+-- because a destroyed map's container still has a parent and still lists its leftover
+-- coins -- that is the ghost pool that once had the character chasing dead coins out
+-- of bounds. And `#GetChildren() > 0` rather than mere existence, because
+-- rebuildContainers deliberately REMEMBERS a container while it is empty; if the
+-- lobby turned out to hold one, plain existence would read as a permanent round and
+-- this whole block would silently never fire, which is the worst way for it to fail.
+--
+-- Deliberately NOT keyed on the coin pool: that is filtered by the category tickboxes,
+-- so a user who unticks everything would look identical to a dead server.
+Drain.watch = function()
+	if Drain.hop then return end                   -- committed already; never twice
+	local now = os.clock()
+	if (now - Drain.look) < STALL_LOOK then return end
+	Drain.look = now
+
+	-- ARM ON FIRST LOOK. Drain.seen starts at 0 and os.clock() is time since the
+	-- process started, so an unarmed clock reads as "hours ago" -- it would hop
+	-- instantly on the first check. setCollecting stamps it too; this is the guard
+	-- that makes the bug impossible rather than merely unlikely.
+	if Drain.seen == 0 then
+		Drain.seen = now
+		return
+	end
+
+	for _, c in ipairs(containers) do
+		if alive(c) and #c:GetChildren() > 0 then
+			Drain.seen = now
+			return
+		end
+	end
+	if (now - Drain.seen) < STALL_AFTER then return end
+
+	-- LATCH BEFORE THE ACTION, not after. This is the same lesson the device picker
+	-- taught the hard way: everything below yields, and a latch set afterwards leaves
+	-- a window in which the next Heartbeat walks straight back in here. One press.
+	Drain.hop = true
+	-- ...AND A LATCH NEEDS ITS OWN RELEASE, independent of the code that set it. The
+	-- tail of the thread below clears it, but that thread can park forever: HttpGet is
+	-- an executor function with no timeout of its own, and a request that never returns
+	-- leaves Drain.hop set, the driver returning early on every single frame, and the
+	-- character standing still for the rest of the session -- "stuck and cannot go to
+	-- coins anymore", caused by a rescue attempt. A hop we cannot finish must never
+	-- cost us the collector, so the release is scheduled here, before anything yields.
+	task.delay(60, function()
+		if Drain.hop then
+			Drain.hop, Drain.seen = false, os.clock()
+			coinWarn("the server hop never finished -- carrying on in this server")
+		end
+	end)
+	coinWarn("no round has started for " .. math.floor(STALL_AFTER / 60)
+		.. " minutes -- this server looks wedged, hopping to another one")
+
+	-- Stop driving the character BEFORE the teleport. Noclip off so we leave solid,
+	-- and the worker down so nothing is still firing touches at a map we are leaving.
+	setNoclip(false)
+	stopDrain()
+
+	task.spawn(function()
+		local TS = game:GetService("TeleportService")
+		local pid, me = game.PlaceId, Players.LocalPlayer
+
+		-- AIM AT A DIFFERENT INSTANCE. TeleportService:Teleport(placeId) is allowed to
+		-- drop us back into the server we just left, which for a wedged server is the
+		-- one outcome that helps nobody. The public server list gives us job ids to
+		-- aim at instead. game:HttpGet is an executor function, and on some executors
+		-- reading a member the DataModel does not have THROWS rather than returning
+		-- nil -- hence the pcall around the call itself rather than a type() check.
+		local busy, any = {}, {}
+		local ok, body = pcall(function()
+			return game:HttpGet("https://games.roblox.com/v1/games/" .. tostring(pid)
+				.. "/servers/Public?sortOrder=Desc&limit=100")
+		end)
+		if ok and type(body) == "string" then
+			local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+			if ok2 and type(data) == "table" and type(data.data) == "table" then
+				for _, s in ipairs(data.data) do
+					if type(s) == "table" and type(s.id) == "string"
+						and s.id ~= game.JobId                  -- not the one we are in
+						and type(s.playing) == "number"
+						and type(s.maxPlayers) == "number"
+						and s.playing < s.maxPlayers then       -- a full one refuses us
+						-- PREFER A POPULATED SERVER. MM2 needs players to start a
+						-- round, so an empty one can look just as wedged as the one we
+						-- are escaping. Not a hard requirement: if nothing busy is
+						-- listed we take anything with room.
+						local t = (s.playing >= 4) and busy or any
+						t[#t + 1] = s.id
+					end
+				end
+			end
+		end
+		local list = (#busy > 0) and busy or any
+
+		-- "pcall did not throw" IS NOT "the teleport worked" -- the same trap that hid a
+		-- dead firetouchinterest in this file for weeks. TeleportToPlaceInstance returns
+		-- immediately and fails asynchronously, so a job id that filled up or died in
+		-- the seconds since the listing sails through the pcall and lands nowhere. The
+		-- only honest test is whether this thread is still running afterwards: if the
+		-- teleport took, the client is loading another server and the wait never
+		-- returns. So every attempt is "ask, then wait to be proved wrong".
+		local function try(fn)
+			if not pcall(fn) then return end
+			task.wait(10)
+		end
+		for _ = 1, 3 do
+			if #list == 0 then break end
+			local i = math.random(1, #list)
+			local pick = list[i]
+			table.remove(list, i)          -- never spend an attempt on the same dead id
+			try(function() TS:TeleportToPlaceInstance(pid, pick, me) end)
+		end
+		-- Last resort: a plain rejoin. It may land us back here, but a wedged server
+		-- we never leave is worse than a coin flip we can take again later.
+		try(function() TS:Teleport(pid, me) end)
+
+		-- STILL HERE. Unlatch so a later window can try again -- but push the clock
+		-- forward at the same time, or the next check is five seconds away and this
+		-- becomes a hop storm. Retry in another STALL_AFTER, or never; both are
+		-- better than hammering TeleportService.
+		Drain.seen, Drain.hop = os.clock(), false
+		coinWarn("server hop failed -- still in this server after four attempts")
+	end)
+end
+
 -- STOP THE CHARACTER — and stopping is an active instruction, not a `return`.
 -- Noclip is on for the whole run, so any frame that skips the CFrame write hands
 -- the character to gravity and it sinks through the map. Every path out of
@@ -2131,11 +2345,93 @@ end
 local function holdStill(hrp)
 	hrp.CFrame = CFrame.new(hrp.Position) * (hrp.CFrame - hrp.Position)
 	pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
+	-- AND NOT hrp.Position. This line used to stamp the position, on the reasoning
+	-- that a frozen frame is a measurement too. It is a measurement of the wrong
+	-- thing: during a stop we write the same point sixty times a second and never ask
+	-- for any speed at all, so anything that nudges us -- another player walking into
+	-- us, a spinning part, a lift, a knife throw -- would be charged to the speed
+	-- governor and ratchet the ceiling down over a state that had nothing to do with
+	-- speed. Clearing it means the governor simply does not measure across a stop, and
+	-- only ever judges frames where we actually asked to move.
+	Drain.wrote = nil
 end
 
 -- move the root toward pos at coinSpeed studs/second, keeping the current facing
 local function glideToward(hrp, pos, dt)
 	local here = hrp.Position
+	local now  = os.clock()
+
+	--==========================================================================
+	-- THE GOVERNOR — and this is the honest answer to "let me run at 80 without
+	-- being kicked", so it is worth saying plainly what can and cannot be done.
+	--
+	-- The kick is 100% SERVER side. A dedicated hunt for the string "Invalid position"
+	-- in every client script found zero hits, so there is no client-side check to
+	-- satisfy, disable or fool. Whatever the server measures, it measures on the
+	-- positions we send it, and no amount of clamping on this side makes 80 studs/s
+	-- look like 40 studs/s to something counting studs per tick.
+	--
+	-- So stop trying to guess the threshold and MEASURE it, per server, live. After we
+	-- write a position, the next frame reads it back. If the server accepted the move,
+	-- the read-back is where we put it, off only by one frame of gravity -- hundredths
+	-- of a stud. If the server refused it, the read-back is somewhere else, because a
+	-- rejection means the server put us back. That difference is a direct, first-hand
+	-- signal that we are over the line, and crucially it arrives BEFORE the kick.
+	--
+	-- On pushback the ceiling drops 25%; after three quiet seconds it creeps back up 8%
+	-- until it reaches the slider again and stops governing entirely. So the slider is
+	-- now a REQUEST, not an instruction: ask for 80 and you get 80 wherever the server
+	-- allows it and the fastest speed it does allow everywhere else. That is why the
+	-- slider's ceiling went up rather than the clamps coming down -- asking for more
+	-- than a server permits is no longer how you get kicked, it is how you find out.
+	--
+	-- What this does NOT do is make a hard server-side speed limit go away. If a server
+	-- refuses everything over 45, this settles at 45 and says so in the console. That is
+	-- information, not a failure.
+	--==========================================================================
+	if Drain.wrote then
+		local off = (here - Drain.wrote).Magnitude
+		-- THE TOLERANCE HAS TO KNOW THE FRAME RATE. Velocity is zeroed after every
+		-- write, so between a write and the next read gravity only builds from a
+		-- standstill: half g t squared, which is a hundredth of a stud at 60 FPS but
+		-- close to four studs at 5 FPS. A flat threshold would therefore start reading
+		-- ordinary gravity as the server pushing back on exactly the machines that can
+		-- least afford to be slowed down further. Add the frame's own fall to it.
+		local tol = DRIFT_TOL + 0.5 * workspace.Gravity * dt * dt
+		if off > TP_JUMP then
+			-- Tens of studs is not an argument about speed, it is a respawn, a round
+			-- change or a teleport pad. Charging the governor for those would ratchet it
+			-- to the floor over an evening of play, so the sample is thrown away -- and
+			-- the clock is stamped so it does not count as a quiet frame either. We have
+			-- no information from this frame, in either direction.
+			Drain.bump = now
+		elseif off > tol then
+			local from = (Drain.cap < math.huge) and Drain.cap or coinSpeed
+			Drain.cap  = math.max(20, from * 0.75)   -- 20 is the floor; see the recovery below
+			Drain.bump = now
+			if (now - Drain.said) > 5 then
+				Drain.said = now
+				coinWarn("the server moved us back " .. string.format("%.0f", off)
+					.. " studs -- easing off to about " .. string.format("%.0f", Drain.cap)
+					.. " studs/s. Your slider is a request, not a promise.")
+			end
+		elseif Drain.cap < math.huge and (now - Drain.bump) > 2 then
+			-- RECOVERY HAS TO BE FAST ENOUGH TO NOTICE. This was 8% every 3 seconds,
+			-- and from the floor back to a slider of 60 that is twenty-one steps -- over
+			-- a minute of crawling after one bad patch, and permanently pinned at the
+			-- floor if anything corrects us even once every three seconds. A quarter
+			-- every two seconds covers the same ground in about ten. The floor was
+			-- raised to 20 for the same reason: 12 studs/s is slower than walking, and
+			-- a collector that slow is indistinguishable from a stuck one.
+			Drain.cap  = Drain.cap * 1.25
+			Drain.bump = now
+			-- Reached the slider again: stop governing altogether rather than sitting
+			-- one percent under it forever, so the common case costs one comparison.
+			if Drain.cap >= coinSpeed then Drain.cap = math.huge end
+		end
+	end
+	local speed = (Drain.cap < math.huge) and math.min(coinSpeed, Drain.cap) or coinSpeed
+
 	-- Never hand the engine a position we cannot vouch for. A NaN or an
 	-- out-of-world coordinate replicates as an invalid position and the server
 	-- kicks for it, so a bad goal means stand still, not "try it and see".
@@ -2147,25 +2443,55 @@ local function glideToward(hrp, pos, dt)
 	local goal = pos + Vector3.new(0, 1.5, 0)
 	local delta = goal - here
 	local dist  = delta.Magnitude
+	local dtc   = math.min(dt, 1 / 30)
 	-- Speed 0 is a real setting now that the slider starts there, and "already on
 	-- top of the goal" is a real state. Both take a step of zero, and BOTH still
 	-- write the position: an early return here would be the sinking bug again.
 	local step = 0
-	if dist >= 0.05 and coinSpeed > 0 then
-		-- THE ANTI-KICK CLAMP. dt is capped at a thirtieth and the whole step at
-		-- MAX_STEP, so a frame hitch — a round change, a map load, an alt-tab —
-		-- cannot turn one frame into a 25-stud jump. It never bites in normal
-		-- play (100 studs/s at 60fps is 1.7 studs a frame); it only exists for
-		-- the hitch, which is exactly when the server is least forgiving.
-		step = math.min(dist, coinSpeed * math.min(dt, 1 / 30), MAX_STEP)
+	if dist >= 0.05 and speed > 0 then
+		-- dt is capped at a thirtieth so a frame hitch -- a round change, a map load,
+		-- an alt-tab -- cannot turn one frame into a 25-stud jump. MAX_STEP sits on
+		-- top of that and, at the slider's current range, never reaches; see its
+		-- declaration. The cap that matters is the vertical one, below.
+		step = math.min(dist, speed * dtc, MAX_STEP)
 	end
-	local nextPos = (step > 0) and (here + delta.Unit * step) or here
-	if not sanePos(nextPos) then nextPos = here end
+	local move = (step > 0) and (delta.Unit * step) or Vector3.zero
+	-- VERTICAL IS NOT HORIZONTAL, and this is the half of the "Invalid position"
+	-- report that is intermittent. 45 studs/s across a floor is a fast player and a
+	-- server-side check has to tolerate something like it; 45 studs/s straight UP is
+	-- not a motion the engine can produce for a character at all, at any speed, and
+	-- this driver asks for exactly that whenever the nearest coin is on a roof or an
+	-- upper storey. Most approaches are flat, some are a climb -- which is why it
+	-- happens sometimes and not every round. Clamp the climb on its own axis so the
+	-- horizontal speed the user chose is untouched.
+	local climb = CLIMB_RATE * dtc
+	if math.abs(move.Y) > climb then
+		move = Vector3.new(move.X, (move.Y > 0) and climb or -climb, move.Z)
+	end
+	local nextPos = here + move
+	if not sanePos(nextPos) then
+		nextPos, move = here, Vector3.zero
+	end
 	-- CFrame.new(pos) alone would snap the character to face north; keep rotation
 	hrp.CFrame = CFrame.new(nextPos) * (hrp.CFrame - hrp.Position)
 	-- gravity would otherwise accumulate between our writes and fling us down
+	--
+	-- AND IT HAS TO BE ZERO, not the vector we actually moved at. Reporting the
+	-- real velocity is tempting -- zero describes a body that changes position
+	-- every frame while standing perfectly still, and that contradiction grows with
+	-- the speed slider. But the CFrame write is not a substitute for physics, it is
+	-- on top of it: the engine still integrates whatever velocity we leave here
+	-- between our writes, the drift lands in hrp.Position, and the next frame steps
+	-- a full coinSpeed on top of the drift. Handing over the honest vector would
+	-- therefore run the character at roughly DOUBLE the chosen speed, which is the
+	-- exact opposite of what an anti-kick change is for. Zero it.
+	--
+	-- Zeroing it is also what makes the governor above trustworthy: with no velocity
+	-- left to integrate, the only thing that can move us between our write and the
+	-- next read is the server.
 	pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
-	return dist - step
+	Drain.wrote = nextPos
+	return dist - move.Magnitude
 end
 
 local function coinFrame(dt)
@@ -2185,12 +2511,20 @@ local function coinFrame(dt)
 
 	-- Dead is not a state to fly in. MM2 leaves the body behind for a moment after
 	-- a kill, and shoving a corpse across the map is both pointless and exactly
-	-- the sort of position a server-side check objects to. Let go and let it lie —
-	-- no CFrame write at all here, because sinking does not matter to a corpse and
-	-- a fresh character is on its way.
+	-- the sort of position a server-side check objects to. Let go of the target --
+	-- but PARK the body, do not simply return. The note that used to sit here said
+	-- sinking does not matter to a corpse, and that was wrong on one point: the
+	-- noclip loop is gated on `noclipOn` alone, not on being alive, so it keeps
+	-- clearing CanCollide on a dead character. A body nobody writes a CFrame for is
+	-- then falling with nothing under it and no floor to catch it, and a few seconds
+	-- of that is thousands of studs below the map -- an out-of-world position
+	-- arriving at the server under our name, and not even in exchange for a coin.
+	-- Holding the root freezes the death flop where it lands, which is a cosmetic
+	-- price worth paying for never sending that position.
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if hum and hum.Health <= 0 then
 		targetInst = nil
+		holdStill(hrp)
 		return
 	end
 
@@ -2265,9 +2599,30 @@ local function coinFrame(dt)
 					-- any other coin would make it invisible to targeting 10 studs
 					-- out, so the character would peel off early and never actually
 					-- get there — the stop would never fire at all.
-					if d <= COIN_STOP and queued < QUEUE_CAP then
-						pushClaim(inst, now)
-						queued = queued + 1
+					-- ARRIVAL IS UNCONDITIONAL, and the `and queued < QUEUE_CAP` that used
+					-- to sit on this line is the freeze the user reported as "sometimes it
+					-- stuck my character". With the queue at cap this test failed, so
+					-- arrival never happened: we fell through to the `d <= COIN_RADIUS`
+					-- branch below, glideToward measured a distance under its own 0.05
+					-- floor, took a step of zero, and wrote the same position every frame
+					-- FOREVER -- parked on top of a coin, waiting for a queue that only
+					-- drains while the character is doing something else.
+					--
+					-- It also disarmed its own rescue: Drain.stuck is reset on every frame
+					-- that HAS a target, so the unstick self-heal below never ran either.
+					--
+					-- The claim is the optional half; letting go of the target is the half
+					-- that must always happen. With no room in the queue the coin is
+					-- benched instead of left loose, because an unclaimed coin two studs
+					-- away becomes `best` again on the very next frame and we would stop on
+					-- it over and over -- a slower freeze, not a fix.
+					if d <= COIN_STOP then
+						if queued < QUEUE_CAP then
+							pushClaim(inst, now)
+							queued = queued + 1
+						else
+							blocked[inst] = now
+						end
 						if coinDelay > 0 then holdUntil = now + coinDelay end
 						targetInst = nil
 					elseif d <= COIN_RADIUS then
@@ -2298,12 +2653,39 @@ local function coinFrame(dt)
 
 	if tgtPart then
 		Drain.stuck = 0
+		-- A TARGET IS NOT PROGRESS, and this is the general form of the freeze fixed
+		-- above. Drain.stuck is reset on the line before this one, so ANY state that
+		-- holds a target without ever finishing it -- an unreachable coin, a climb the
+		-- vertical clamp cannot win, a governor crawl, a coin inside geometry, or the
+		-- next bug of this shape that nobody has found yet -- used to be invisible to
+		-- the self-heal. So stop asking "is there a target" and ask "are we getting
+		-- closer". A full stud of gain resets the clock; Drain.nogain seconds without
+		-- one means this coin is not happening, so bench it and pick another. Measured
+		-- in distance rather than as a deadline, which is what makes it independent of
+		-- the speed slider and of whatever the governor has decided today.
+		local d = (tgtPart.Position - hrp.Position).Magnitude
+		if Drain.aim ~= targetInst then
+			Drain.aim, Drain.near, Drain.gain = targetInst, d, now
+		elseif d < (Drain.near - 1) then
+			Drain.near, Drain.gain = d, now
+		elseif (now - Drain.gain) > Drain.nogain then
+			if targetInst then blocked[targetInst] = now end
+			coinWarn("no closer to that coin for " .. Drain.nogain .. "s ("
+				.. string.format("%.0f", d) .. " studs out) -- benching it and re-picking")
+			targetInst, Drain.aim = nil, nil
+			holdStill(hrp)
+			return
+		end
 		glideToward(hrp, tgtPart.Position, dt)
 	else
 		-- the target was collected, destroyed, or dropped out of the pool. This
 		-- assignment runs even when best is nil, on purpose: holding a strong
 		-- reference to a destroyed Instance is exactly the leak we don't allow.
 		targetInst = best
+		-- Drain.aim goes with it. It is a strong reference to a coin, so it must never
+		-- outlive the target it describes -- same rule as the assignment above, and the
+		-- reason that one runs even when best is nil.
+		Drain.aim = nil
 		if best then
 			Drain.stuck = 0
 			glideToward(hrp, bestPart.Position, dt)
@@ -2330,16 +2712,67 @@ local function coinFrame(dt)
 	end
 end
 
+-- A DUMP CANNOT SEE ANY OF THIS. Everything the collector runs on is a top-level
+-- local, and a diagnostic in a separate file is a separate chunk: it can read the
+-- workspace and the character, but not one field of Drain, not the queue depth, not the
+-- governor's ceiling. Which means the three most useful facts about a freeze have never
+-- been reachable from a .txt file. So the hub publishes them instead -- one global,
+-- read-only, built on demand, nilled in Bin.onUnload because getgenv() outlives the
+-- close button. Zero top-level locals added, which is the other reason it is a global.
+getgenv().ArjhayCoinSnap = function()
+	local live, bench = 0, 0
+	for _ in pairs(claimed) do live = live + 1 end
+	for _ in pairs(blocked) do bench = bench + 1 end
+	local cn = {}
+	for _, c in ipairs(containers) do
+		cn[#cn + 1] = (alive(c) and (c.Name .. "=" .. #c:GetChildren()) or "(dead)")
+	end
+	local t = targetInst
+	return {
+		on       = autoCoins,
+		speed    = coinSpeed,
+		cap      = Drain.cap,
+		queue    = claimTail - claimHead + 1,
+		queuecap = QUEUE_CAP,
+		claimed  = live,
+		blocked  = bench,
+		stamp    = Drain.stamp,
+		stuck    = Drain.stuck,
+		hop      = Drain.hop,
+		seen     = Drain.seen,
+		holdfor  = holdUntil - os.clock(),
+		noclip   = noclipOn,
+		target   = t and t.Name or "(none)",
+		tgtalive = (t ~= nil) and alive(partOf(t)) or false,
+		near     = Drain.near,
+		gain     = Drain.gain,
+		wrote    = Drain.wrote,
+		conts    = table.concat(cn, " "),
+		pool     = #livePool(),
+		now      = os.clock(),
+	}
+end
+
 local function setCollecting(on)
 	autoCoins = on
 	if on then
 		if driveConn then return end
 		dropClaims()
-		setNoclip(true)                       -- on for the whole run, by request
+		setNoclip(true)                       -- on for the whole flight, by request
+		-- Arm the stall watch fresh. Drain.hop is cleared as well as stamped: a latch
+		-- only ever survives a failed teleport, but a latch left set would make the
+		-- collector silently do nothing, and silence is the failure mode this hub
+		-- fights hardest.
+		Drain.seen, Drain.look, Drain.hop = os.clock(), 0, false
 		livePool(true)                        -- first frame already has a target
 		startDrain()
 		driveConn = Bin.conn(RunService.Heartbeat:Connect(function(dt)
 			if not autoCoins then return end
+			-- A COMMITTED HOP STOPS THE DRIVER DEAD, and it has to come before the
+			-- watchdog below or that would helpfully restart the worker we just shut
+			-- down. Teleporting takes a second or two; writing CFrames across it is
+			-- how you turn a clean hop into an "Invalid position" kick.
+			if Drain.hop then return end
 			-- THE WATCHDOG. The worker stamps every iteration, so a stamp older than two
 			-- seconds means it is dead or wedged -- and a dead worker used to look
 			-- exactly like a quiet queue, which is what made the stuck unfixable from
@@ -2349,6 +2782,10 @@ local function setCollecting(on)
 				coinWarn("drain worker stopped responding -- restarting it")
 				startDrain()
 			end
+			-- pcall'd like coinFrame: the stall watch talks to TeleportService and an
+			-- HTTP endpoint, and neither is allowed to take the collector down with it
+			local okw, errw = pcall(Drain.watch)
+			if not okw then coinWarn("stall watch: " .. tostring(errw)) end
 			-- never swallow the throw: a silent collector is unfixable
 			local ok, err = pcall(coinFrame, dt)
 			if not ok then coinWarn(err) end
@@ -2367,9 +2804,21 @@ end
 -- the driver is a connection, but the drain worker is a spawned loop that
 -- Bin.flush() cannot reach — it needs the flag cleared or it keeps touching
 -- coins after unload. Do NOT teleport anything here: unloading the hub should
--- never move the character somewhere it did not ask to go.
+-- never move the character somewhere it did not ask to go — and that goes double
+-- for the stall watch, whose whole job is to teleport. Its latch and its clock are
+-- both cleared, because getgenv() outlives the close button and a stale latch would
+-- leave the next load's collector running with the driver returning on frame one.
 Bin.onUnload(function()
 	autoCoins = false
+	Drain.seen, Drain.look, Drain.hop = 0, 0, false
+	-- The governor's ceiling is knowledge about THIS server, and it is deliberately
+	-- kept across a toggle -- there is no point relearning it every time the collector
+	-- is turned off and on. But it must not survive the hub itself: getgenv() outlives
+	-- the close button, and a reload inheriting a 12 studs/s ceiling would look for all
+	-- the world like a broken tween slider.
+	Drain.wrote, Drain.cap, Drain.bump, Drain.said = nil, math.huge, 0, 0
+	Drain.aim, Drain.near, Drain.gain = nil, 0, 0
+	getgenv().ArjhayCoinSnap = nil   -- the snapshot closes over every local above it
 	if driveConn then
 		pcall(function() driveConn:Disconnect() end)
 		driveConn = nil
@@ -2393,8 +2842,18 @@ end))
 
 -- 0 is a real setting on this one, not a floor: at 0 the character stops flying
 -- and only takes coins that come to it (see glideToward)
+--
+-- CEILING RAISED TO 200 FROM 100, and the governor in glideToward is what makes that
+-- safe rather than reckless. Before it, a number over the server's tolerance was a
+-- kick; now it is a request that gets measured and eased down within a second or two.
+-- So set this high on purpose: the console will tell you what the server actually
+-- allowed. Turning the value UP can no longer be the thing that gets you kicked.
+--
+-- Raising it does not wake MAX_STEP: 200 studs/s against the dt cap of a thirtieth is
+-- 6.7 studs a frame, still under the 8-stud backstop. It would only start to bind
+-- somewhere past 240.
 Cfg.add("farm.coins.speed", "slider",
-coinSec:Slider("Tween Speed (studs/s)", 0, 100, 60, function(v) coinSpeed = v end))
+coinSec:Slider("Tween Speed (studs/s)", 0, 200, 60, function(v) coinSpeed = v end))
 -- the length of the deliberate stop at each coin. It starts at 1 by request, so
 -- there is no longer a "never stop" setting here.
 Cfg.add("farm.coins.delay", "slider",
@@ -2403,10 +2862,23 @@ coinSec:Slider("Delay Between Pickups", 1, 2, 1, function(v) coinDelay = v end))
 Cfg.add("farm.coins.enabled", "toggle",
 coinSec:Toggle("Auto Collect Coins", false, function(on) setCollecting(on) end))
 
--- Deleted by request: "Return To Start When Empty", the status label, and the
--- "Extra Names" textbox. Pickup names come from the ReplicatedStorage.Coins
--- templates plus the by-position CoinContainer scan; there is nothing left to
--- type in. Failures go to the console through coinWarn.
+-- Deleted by request: "Return To Start When Empty", the status label, the
+-- "Extra Names" textbox, and Aura Mode. Pickup names come from the
+-- ReplicatedStorage.Coins templates plus the by-position CoinContainer scan; there
+-- is nothing left to type in. Failures go to the console through coinWarn.
+--
+-- AURA MODE IS GONE AND THE REASON IS WORTH KEEPING, because it is the answer to a
+-- question that will get asked again. It was one toggle that stopped the flying and
+-- let the worker fire firetouchinterest at every coin inside the radius -- no new
+-- machinery, because Drain.step has always fired at range. It was built with both
+-- argument orders and a 0.4s hold (both real bugs, both still fixed in forceTouch
+-- below), tested in a live server, and it banked nothing.
+--
+-- So this is now MEASURED, not assumed: firetouchinterest does not pay out an MM2
+-- coin at a distance. Physical contact is the only pickup mechanism, which means the
+-- flying is not an implementation detail that a cleverer touch could replace -- it IS
+-- the mechanism. Do not rebuild this. If a future idea starts with "we could collect
+-- without moving", that idea has already been tested and it lost.
 
 --------------------------------------------------------------------
 -- Auto Claim Shells
