@@ -2061,6 +2061,10 @@ local Drain = {
 	look    = 0,                                    -- clock of the last stall check (throttle)
 	hop     = false,                                -- latched the instant a hop is committed
 	watch   = nil,                                  -- the stall check; assigned below
+	live    = nil,                                  -- "is a round running?"; assigned below
+	hopOn   = false,                                -- the Farm tab toggle; nothing looks while false
+	wgen    = 0,                                    -- invalidates an old watcher loop, like driveGen
+	tick    = 0,                                    -- clock of the last "still waiting" console line
 	-- THE SPEED GOVERNOR. Same reasoning: fields, not locals. See glideToward.
 	wrote   = nil,                                  -- the exact position we last handed the engine
 	cap     = math.huge,                            -- studs/s this server has been seen to tolerate
@@ -2083,7 +2087,11 @@ local MAX_STEP      = 8        -- studs the root may move in a SINGLE frame, any
 -- CLIMB_RATE is the one that does bite. See the note in glideToward.
 local CLIMB_RATE    = 18       -- studs/second the root may gain or lose VERTICALLY
 -- One line, two names, because this file is close to Luau's 200-register ceiling.
-local STALL_AFTER, STALL_LOOK = 20 * 60, 5   -- s of no round before hopping; s between checks
+-- TEN MINUTES, DOWN FROM TWENTY, by request — and nothing else had to change for it.
+-- An MM2 round runs a couple of minutes and the lobby between two of them is seconds,
+-- so a healthy server refreshes this clock every two or three minutes at worst and ten
+-- is still several times the longest honest gap. Do not take it much below five.
+local STALL_AFTER, STALL_LOOK = 10 * 60, 5   -- s of no round before hopping; s between checks
 -- The governor's two thresholds, both in studs, measured on the position we get BACK
 -- after writing one. Normal drift between a write and the next frame's read is under a
 -- tenth of a stud (gravity for one frame, with velocity zeroed), so 5 is enormously
@@ -2201,27 +2209,64 @@ end
 -- exactly what it should with nothing to collect. Nothing on the client can restart
 -- a server-side round loop, so the only fix available to us is to leave.
 --
--- NO TOGGLE, by request. This is not a feature you turn on; it is a condition of the
--- collector running at all, the same way the watchdog above is. It only ever looks
--- while Auto Collect Coins is on, and it can only ever fire once.
+-- NOW A TOGGLE, by request: "Auto Hop If No Round" on the Farm tab. It used to be an
+-- unconditional condition of the collector running, and that is exactly what made the
+-- reported failure — twenty minutes of no round and no hop — so hard to see. See the
+-- Auto Server Hop section further down for its driver; the two FIXES that make it fire
+-- are numbered there and here.
 --
--- WHAT COUNTS AS "A ROUND IS RUNNING". There is still no round-state value in this
--- game -- 169 remotes enumerated, no stage or timer value worth reading -- so the
--- signal is the one the collector already trusts everywhere else: a LIVE CoinContainer
--- WITH CHILDREN. Coins exist during a round and are destroyed with the map, so
--- children in a live container is a round, and no container at all is the lobby.
---
--- Both halves of that test are load-bearing. `alive()` rather than `.Parent ~= nil`,
--- because a destroyed map's container still has a parent and still lists its leftover
--- coins -- that is the ghost pool that once had the character chasing dead coins out
--- of bounds. And `#GetChildren() > 0` rather than mere existence, because
--- rebuildContainers deliberately REMEMBERS a container while it is empty; if the
--- lobby turned out to hold one, plain existence would read as a permanent round and
--- this whole block would silently never fire, which is the worst way for it to fail.
---
--- Deliberately NOT keyed on the coin pool: that is filtered by the category tickboxes,
--- so a user who unticks everything would look identical to a dead server.
+-- WHAT COUNTS AS "A ROUND IS RUNNING" now lives in Drain.live below, because the way
+-- that question was asked WAS the bug.
+Drain.live = function()
+	-- There is still no round-state value in this game -- 169 remotes enumerated, no
+	-- stage or timer value worth reading -- so the signal is the one the collector
+	-- already trusts everywhere else: a LIVE CoinContainer WITH CHILDREN. Coins exist
+	-- during a round and are destroyed with the map, so children in a live container is
+	-- a round, and no container at all is the lobby.
+	--
+	-- All three halves of that test are load-bearing.
+	--   · `alive()` rather than `.Parent ~= nil`, because a destroyed map's container
+	--     still has a parent and still lists its leftover coins -- that is the ghost
+	--     pool that once had the character chasing dead coins out of bounds.
+	--   · `#GetChildren() > 0` rather than mere existence, because rebuildContainers
+	--     deliberately REMEMBERS a container while it is empty.
+	--   · CONTAINER_NAMES -- FIX #2, and the half that was missing. `containers` is NOT
+	--     a list of CoinContainers: rebuildContainers adds the PARENT of every name hit
+	--     too, so any ticked category whose parts live somewhere permanent puts that
+	--     permanent parent in the list, where it is alive with children forever. ONE
+	--     entry like that re-stamped Drain.seen on every check and the window could
+	--     never elapse -- a permanent round, exactly the silent never-fires this block's
+	--     old comment said was the worst way for it to fail. It was right.
+	local function held(c)
+		return c ~= nil and CONTAINER_NAMES[c.Name] and alive(c)
+			and #c:GetChildren() > 0
+	end
+	-- The collector's list first: free when it is warm, and it remembers the container
+	-- between rounds. But it is only ever rebuilt from candidates(), which only runs
+	-- inside the collector's loop -- so with Auto Collect Coins off it is a frozen
+	-- snapshot and cannot be the only source.
+	for _, c in ipairs(containers) do
+		if held(c) then return true end
+	end
+	-- Then ask Workspace directly, at the two levels the confirmed path uses
+	-- (Workspace.<Map>.CoinContainer). GetChildren once plus a native FindFirstChild
+	-- per child -- never GetDescendants: this runs every few seconds whether or not the
+	-- collector is on, and that walk is tens of thousands of instances.
+	for _, child in ipairs(workspace:GetChildren()) do
+		if held(child) then return true end
+		-- keyed off CONTAINER_NAMES rather than a literal, so this cannot drift out of
+		-- step with the collector's own idea of what a container is called
+		for cname in pairs(CONTAINER_NAMES) do
+			if held(child:FindFirstChild(cname)) then return true end
+		end
+	end
+	return false
+	-- Deliberately NOT keyed on the coin pool: that is filtered by the category
+	-- tickboxes, so a user who unticks everything would look identical to a dead server.
+end
+
 Drain.watch = function()
+	if not Drain.hopOn then return end             -- the Farm tab toggle owns this
 	if Drain.hop then return end                   -- committed already; never twice
 	local now = os.clock()
 	if (now - Drain.look) < STALL_LOOK then return end
@@ -2229,20 +2274,30 @@ Drain.watch = function()
 
 	-- ARM ON FIRST LOOK. Drain.seen starts at 0 and os.clock() is time since the
 	-- process started, so an unarmed clock reads as "hours ago" -- it would hop
-	-- instantly on the first check. setCollecting stamps it too; this is the guard
+	-- instantly on the first check. The toggle stamps it too; this is the guard
 	-- that makes the bug impossible rather than merely unlikely.
 	if Drain.seen == 0 then
-		Drain.seen = now
+		Drain.seen, Drain.tick = now, now
 		return
 	end
 
-	for _, c in ipairs(containers) do
-		if alive(c) and #c:GetChildren() > 0 then
-			Drain.seen = now
-			return
-		end
+	if Drain.live() then
+		Drain.seen, Drain.tick = now, now
+		return
 	end
-	if (now - Drain.seen) < STALL_AFTER then return end
+	local dry = now - Drain.seen
+	if dry < STALL_AFTER then
+		-- COUNT IT OUT LOUD. "It never hopped" and "it never even looked" are
+		-- indistinguishable from outside, and that ambiguity is what cost a whole
+		-- session's worth of guessing. One line a minute while the clock runs, so the
+		-- console answers the question without a dump.
+		if (now - Drain.tick) >= 60 then
+			Drain.tick = now
+			coinWarn(("no round for %d of the %d minutes that trigger a hop")
+				:format(math.floor(dry / 60), math.floor(STALL_AFTER / 60)))
+		end
+		return
+	end
 
 	-- LATCH BEFORE THE ACTION, not after. This is the same lesson the device picker
 	-- taught the hard way: everything below yields, and a latch set afterwards leaves
@@ -2257,7 +2312,13 @@ Drain.watch = function()
 	-- cost us the collector, so the release is scheduled here, before anything yields.
 	task.delay(60, function()
 		if Drain.hop then
-			Drain.hop, Drain.seen = false, os.clock()
+			Drain.hop, Drain.seen, Drain.tick = false, os.clock(), os.clock()
+			-- PUT BACK WHAT THE HOP TOOK. Committing to a hop turns noclip off and
+			-- stops the worker; if we are still here, both of those have to come back or
+			-- the collector spends the rest of the session walking into walls with a
+			-- dead queue. The driver's watchdog restarts the worker on its own -- the
+			-- stale stamp is two seconds old by now -- but nothing re-arms noclip.
+			if autoCoins then setNoclip(true) end
 			coinWarn("the server hop never finished -- carrying on in this server")
 		end
 	end)
@@ -2331,7 +2392,8 @@ Drain.watch = function()
 		-- forward at the same time, or the next check is five seconds away and this
 		-- becomes a hop storm. Retry in another STALL_AFTER, or never; both are
 		-- better than hammering TeleportService.
-		Drain.seen, Drain.hop = os.clock(), false
+		Drain.seen, Drain.hop, Drain.tick = os.clock(), false, os.clock()
+		if autoCoins then setNoclip(true) end   -- same restore as the timed release
 		coinWarn("server hop failed -- still in this server after four attempts")
 	end)
 end
@@ -2739,6 +2801,9 @@ getgenv().ArjhayCoinSnap = function()
 		stamp    = Drain.stamp,
 		stuck    = Drain.stuck,
 		hop      = Drain.hop,
+		hopon    = Drain.hopOn,
+		roundlive = (Drain.live ~= nil) and Drain.live() or false,
+		dry      = (Drain.seen > 0) and (os.clock() - Drain.seen) or -1,
 		seen     = Drain.seen,
 		holdfor  = holdUntil - os.clock(),
 		noclip   = noclipOn,
@@ -2759,11 +2824,13 @@ local function setCollecting(on)
 		if driveConn then return end
 		dropClaims()
 		setNoclip(true)                       -- on for the whole flight, by request
-		-- Arm the stall watch fresh. Drain.hop is cleared as well as stamped: a latch
-		-- only ever survives a failed teleport, but a latch left set would make the
-		-- collector silently do nothing, and silence is the failure mode this hub
-		-- fights hardest.
-		Drain.seen, Drain.look, Drain.hop = os.clock(), 0, false
+		-- THE STALL WATCH IS NOT ARMED HERE ANY MORE, and that is deliberate. It used
+		-- to stamp Drain.seen on every switch-on, which meant a user who toggled the
+		-- collector every few minutes reset the ten-minute clock every time and could
+		-- never reach a hop. The Farm tab's Auto Server Hop toggle owns that clock now,
+		-- start to finish. Drain.hop is left alone for the same reason: the latch has
+		-- its own timed release (see Drain.watch), so nothing else needs to clear it,
+		-- and clearing it here could turn a hop in flight back into a driven character.
 		livePool(true)                        -- first frame already has a target
 		startDrain()
 		driveConn = Bin.conn(RunService.Heartbeat:Connect(function(dt)
@@ -2782,10 +2849,13 @@ local function setCollecting(on)
 				coinWarn("drain worker stopped responding -- restarting it")
 				startDrain()
 			end
-			-- pcall'd like coinFrame: the stall watch talks to TeleportService and an
-			-- HTTP endpoint, and neither is allowed to take the collector down with it
-			local okw, errw = pcall(Drain.watch)
-			if not okw then coinWarn("stall watch: " .. tostring(errw)) end
+			-- THE STALL WATCH IS NO LONGER CALLED FROM HERE -- FIX #1, and the likelier
+			-- half of "twenty minutes and it never hopped". As a passenger on this
+			-- connection it could only look while Auto Collect Coins was on AND this
+			-- Heartbeat was alive; a wedged server with the collector off, or a driver
+			-- that had gone down, meant nothing was watching the clock at all. It has
+			-- its own loop under Auto Server Hop now. Do not re-add it here: the
+			-- STALL_LOOK throttle would hide the duplicate rather than complain.
 			-- never swallow the throw: a silent collector is unfixable
 			local ok, err = pcall(coinFrame, dt)
 			if not ok then coinWarn(err) end
@@ -2808,9 +2878,12 @@ end
 -- for the stall watch, whose whole job is to teleport. Its latch and its clock are
 -- both cleared, because getgenv() outlives the close button and a stale latch would
 -- leave the next load's collector running with the driver returning on frame one.
+-- Its own watcher loop is a spawned loop too, so it needs BOTH its flag cleared and
+-- its generation bumped -- the flag alone would leave it parked in a task.wait.
 Bin.onUnload(function()
 	autoCoins = false
-	Drain.seen, Drain.look, Drain.hop = 0, 0, false
+	Drain.seen, Drain.look, Drain.hop, Drain.tick = 0, 0, false, 0
+	Drain.hopOn, Drain.wgen = false, Drain.wgen + 1
 	-- The governor's ceiling is knowledge about THIS server, and it is deliberately
 	-- kept across a toggle -- there is no point relearning it every time the collector
 	-- is turned off and on. But it must not survive the hub itself: getgenv() outlives
@@ -2879,6 +2952,136 @@ coinSec:Toggle("Auto Collect Coins", false, function(on) setCollecting(on) end))
 -- flying is not an implementation detail that a cleverer touch could replace -- it IS
 -- the mechanism. Do not rebuild this. If a future idea starts with "we could collect
 -- without moving", that idea has already been tested and it lost.
+
+--------------------------------------------------------------------
+-- Auto Server Hop   (the stall watch's toggle — see Drain.watch above)
+--------------------------------------------------------------------
+-- ITS OWN DRIVER, and that is FIX #1. Everything the watch needs to decide already
+-- existed and was already tested; what it did not have was anything reliably calling
+-- it. Wrapped in a do-block, and its state lives on Drain as fields, because this file
+-- sits on Luau's 200-register ceiling for top-level locals -- a new one here fails as a
+-- nil call reported against line 1.
+do
+	local hopSec = Farm:Section("Auto Server Hop")
+
+	hopSec:Label("Watches for a round that never starts. Ten minutes without one and the"
+		.. " hub leaves for another server -- one with players in it, and never the one"
+		.. " it is already in. A round counts as running when a live map CoinContainer"
+		.. " holds coins, so this works whether or not Auto Collect Coins is on.")
+
+	hopSec:Label("While it waits it counts the minutes out loud in the console, so a hop"
+		.. " that has not happened yet can be told apart from one that never will. If it"
+		.. " cannot get out after four tries it says so and keeps playing here.")
+
+	local function armHop(on)
+		Drain.hopOn = on
+		Drain.wgen  = Drain.wgen + 1          -- any live watcher falls out of its loop
+		if not on then
+			-- 0, not os.clock(): the watch treats 0 as "not armed" and re-arms on its
+			-- first look, so switching back on can never inherit a stale start time.
+			Drain.seen, Drain.look, Drain.tick = 0, 0, 0
+			return
+		end
+		-- Arm the clock HERE, so the ten minutes are counted from the moment the toggle
+		-- went on rather than from whenever the collector was last switched.
+		Drain.seen, Drain.look, Drain.tick = os.clock(), 0, os.clock()
+		local gen = Drain.wgen
+		task.spawn(function()
+			while Drain.hopOn and Drain.wgen == gen do
+				-- pcall'd like the drain worker, and for a stronger reason: the watch
+				-- talks to TeleportService and an HTTP endpoint, and a throw must not
+				-- end the only loop still watching this server. STALL_LOOK does the
+				-- real throttling -- this 1s tick just keeps the loop cheap.
+				local ok, err = pcall(Drain.watch)
+				if not ok then coinWarn("stall watch: " .. tostring(err)) end
+				task.wait(1)
+			end
+		end)
+	end
+
+	Cfg.add("farm.hop.enabled", "toggle",
+	hopSec:Toggle("Auto Hop If No Round", false, function(on) armHop(on) end))
+
+	-- THE DUMP, because the console cannot be copied out of and this feature has
+	-- exactly one question left that it cannot answer out loud: while the hub sits in a
+	-- lobby that never ends, what is it still counting as a round? Every entry in the
+	-- collector's container list is printed WITH its verdict, so a permanent parent
+	-- holding the clock open (FIX #2) shows up as a line rather than as a theory.
+	local HOP_DUMP = "ArjhayHub_roundwatch.txt"
+
+	hopSec:Button("Dump Round Watch", function()
+		if type(writefile) ~= "function" then
+			warn("[Arjhay Hub] hop: no writefile on this executor, cannot report")
+			return
+		end
+		local out, now = {}, os.clock()
+		local function ln(s) out[#out + 1] = s end
+
+		ln("Arjhay Hub -- round watch dump")
+		local okd, when = pcall(os.date, "%Y-%m-%d %H:%M:%S")
+		ln(okd and tostring(when) or "(os.date unavailable)")
+		ln("JobId " .. tostring(game.JobId))
+		ln("")
+		ln("-- state ------------------------------------------------------")
+		ln("toggle on        " .. tostring(Drain.hopOn))
+		ln("hop latched      " .. tostring(Drain.hop))
+		ln("collector on     " .. tostring(autoCoins))
+		ln(("window           %d s (%d min)")
+			:format(STALL_AFTER, math.floor(STALL_AFTER / 60)))
+		if Drain.seen == 0 then
+			ln("dry for          (clock not armed -- the toggle is off)")
+		else
+			ln(("dry for          %d s"):format(math.floor(now - Drain.seen)))
+		end
+		local okv, verdict = pcall(Drain.live)
+		ln("round is live    " .. (okv and tostring(verdict)
+			or ("THREW: " .. tostring(verdict))))
+		ln("")
+		ln("-- the collector's container list -----------------------------")
+		ln("Only a CoinContainer may hold the clock open. Anything else marked")
+		ln("COUNTS-AS-ROUND below is the bug FIX #2 closed, still present here.")
+		if #containers == 0 then
+			ln("(empty -- nothing found yet, or the collector has never walked)")
+		end
+		for i, c in ipairs(containers) do
+			if i > 40 then
+				ln("(... more, list capped at 40)")
+				break
+			end
+			local okn, line = pcall(function()
+				local kids = #c:GetChildren()
+				local counts = CONTAINER_NAMES[c.Name] and alive(c) and kids > 0
+				return ("%2d  %-18s kids=%-5d alive=%-6s%s\n      %s"):format(
+					i, c.Name, kids, tostring(alive(c)),
+					counts and "COUNTS-AS-ROUND" or "", c:GetFullName())
+			end)
+			ln(okn and line or ("%2d  (threw while reading it: %s)")
+				:format(i, tostring(line)))
+		end
+		ln("")
+		ln("-- Workspace, the two levels the confirmed path uses ----------")
+		local hits = 0
+		for _, child in ipairs(workspace:GetChildren()) do
+			for cname in pairs(CONTAINER_NAMES) do
+				local c = (child.Name == cname) and child or child:FindFirstChild(cname)
+				if c and hits < 40 then
+					hits = hits + 1
+					ln(("%2d  kids=%-5d %s"):format(hits, #c:GetChildren(), c:GetFullName()))
+				end
+			end
+		end
+		if hits == 0 then
+			ln("(no CoinContainer anywhere in Workspace -- that is the lobby, and the")
+			ln(" clock above should be running)")
+		end
+
+		if pcall(writefile, HOP_DUMP, table.concat(out, "\n")) then
+			warn("[Arjhay Hub] hop: wrote " .. HOP_DUMP)
+		else
+			warn("[Arjhay Hub] hop: writefile failed")
+		end
+	end)
+end
 
 --------------------------------------------------------------------
 -- Auto Claim Shells
